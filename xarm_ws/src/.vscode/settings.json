@@ -1,0 +1,18 @@
+{
+    "python.autoComplete.extraPaths": [
+        "/home/hayashi/tomato2025_ws/gripper_ws/install/gripper_control_pkg/lib/python3.10/site-packages",
+        "/home/hayashi/tomato2025_ws/xarm_ws/install/xarm_msgs/local/lib/python3.10/dist-packages",
+        "/home/hayashi/tomato2025_ws/xarm_ws/install/uf_ros_lib/lib/python3.10/site-packages",
+        "/home/hayashi/tomato2025_ws/detection_ws/install/detection2025/lib/python3.10/site-packages",
+        "/opt/ros/humble/lib/python3.10/site-packages",
+        "/opt/ros/humble/local/lib/python3.10/dist-packages"
+    ],
+    "python.analysis.extraPaths": [
+        "/home/hayashi/tomato2025_ws/gripper_ws/install/gripper_control_pkg/lib/python3.10/site-packages",
+        "/home/hayashi/tomato2025_ws/xarm_ws/install/xarm_msgs/local/lib/python3.10/dist-packages",
+        "/home/hayashi/tomato2025_ws/xarm_ws/install/uf_ros_lib/lib/python3.10/site-packages",
+        "/home/hayashi/tomato2025_ws/detection_ws/install/detection2025/lib/python3.10/site-packages",
+        "/opt/ros/humble/lib/python3.10/site-packages",
+        "/opt/ros/humble/local/lib/python3.10/dist-packages"
+    ]
+}

@@ -1,0 +1,6 @@
+# Polygon region to mask out (only used in nvblox mode)
+mask_polygon:
+  - [0, 320]
+  - [640, 320]
+  - [640, 480]
+  - [0, 480]

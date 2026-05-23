@@ -1,0 +1,84 @@
+GRIPPER
+ros2 run gripper_control_pkg gripper_control_node 
+manual test 
+ros2 service call /gripper/open std_srvs/srv/Empty
+ros2 service call /gripper/close std_srvs/srv/Empty
+
+ARM
+ros2 launch xarm_moveit_config xarm7_moveit_realmove.launch.py robot_ip:=192.168.2.213
+ros2 run xarm_moveit_control motion_planning_node 
+ros2 run xarm_moveit_control motion_planning_node --ros-args -p connect_bunker:=true
+
+DETECTION
+
+# must connect to port 3.0
+
+ros2 launch realsense2_camera rs_align_depth_launch.py 
+
+ros2 launch kinect_driver xarm_azure.launch.py
+
+ros2 run detection2025 tomato_detection 
+
+
+
+///////////////////////////DEBUG////////////////
+if USB not responding
+
+systemctl poweroff
+
+manual test tomato success/fail grasp
+ros2 service call /realsense/check_tomato_visible std_srvs/srv/Trigger "{}"
+
+
+BUNKER
+connect to bunker wifi
+passwprd hayashiadmin
+
+ssh hayashi@192.168.1.100 -p 3333
+sosRos2
+ros2 run bunker_bringup bringup_can2usb.bash  //it did once, then skip
+ros2 launch bunker_tomato tomato_base.launch.py 
+
+
+new terminal
+ssh hayashi@192.168.1.100 -p 3333
+sosRos2
+ros2 run bunker_gps server 
+
+
+in another terminal
+test code
+cd Desktop/
+python3 ./test_tcp_bunker.py 
+
+
+sudo shutdown now
+
+
+
+
+
+
+
+
+
+////////////////////////////////////////////////////////
+ros2 launch xarm_api xarm7_driver.launch.py robot_ip:=192.168.1.213
+ros2 launch xarm_moveit_config xarm7_moveit_realmove.launch.py robot_ip:=192.168.1.213
+ros2 run xarm_moveit_control motion_planning_node 
+
+
+test api
+ros2 service call /xarm/motion_enable xarm_msgs/srv/SetInt16ById "{id: 8, data: 1}"
+ros2 service call /xarm/set_mode xarm_msgs/srv/SetInt16 "{data: 0}"
+ros2 service call /xarm/set_state xarm_msgs/srv/SetInt16 "{data: 0}"
+ros2 service call /xarm/set_servo_angle xarm_msgs/srv/MoveJoint "{angles: [0, 0, 0, 0, 0, -1.5708, 0], speed: 0.1, acc: 10, mvtime: 0}"
+ros2 service call /xarm/set_servo_angle xarm_msgs/srv/MoveJoint "{angles: [-0.2339114546775818, -0.14301849901676178, -0.24972625076770782, 1.1027342081069946, -1.0402812957763672, -0.5659984946250916, 0.9236992001533508], speed: 0.1, acc: 10, mvtime: 0}"
+
+
+
+hayashi@hayashi-Dell-G15-5520:~$ ip route
+default via 192.168.1.1 dev wlp0s20f3 proto dhcp metric 20600 
+169.254.0.0/16 dev enp59s0 scope link metric 1000 
+192.168.1.0/24 dev wlp0s20f3 proto kernel scope link src 192.168.1.162 metric 600 
+192.168.2.0/24 dev enp59s0 proto kernel scope link src 192.168.2.200 metric 100 

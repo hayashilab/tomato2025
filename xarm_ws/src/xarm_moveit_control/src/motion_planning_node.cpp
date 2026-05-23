@@ -1,0 +1,1714 @@
+#include <memory>
+#include <rclcpp/rclcpp.hpp>
+#include <moveit/move_group_interface/move_group_interface.h>
+#include <moveit/robot_trajectory/robot_trajectory.h>
+#include <geometry_msgs/msg/pose_stamped.hpp>
+#include <geometry_msgs/msg/pose_array.hpp>
+#include <std_msgs/msg/bool.hpp>
+#include <tf2/LinearMath/Quaternion.h>
+#include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
+#include <vector>
+#include <queue>
+#include <mutex>
+#include <moveit/robot_state/robot_state.h>
+#include <moveit/trajectory_processing/iterative_spline_parameterization.h>
+#include <moveit_msgs/msg/constraints.hpp>
+#include <moveit_msgs/msg/joint_constraint.hpp>
+#include <moveit_msgs/msg/orientation_constraint.hpp>
+#include <moveit/robot_state/conversions.h>
+#include <moveit/trajectory_processing/iterative_time_parameterization.h>
+#include <std_msgs/msg/int32.hpp>
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <std_srvs/srv/empty.hpp>
+#include <std_srvs/srv/trigger.hpp>
+
+//////////////////// Helper functions for service retry and async calling //////////////////////////////////////////////////
+// === Retry until service is available ===
+bool waitForServiceWithRetry(rclcpp::ClientBase::SharedPtr client,
+                             std::chrono::seconds total_timeout,
+                             std::chrono::milliseconds retry_interval,
+                             rclcpp::Logger logger,
+                             const std::string &service_name)
+{
+    auto start = std::chrono::steady_clock::now();
+    while (std::chrono::steady_clock::now() - start < total_timeout)
+    {
+        if (client->wait_for_service(retry_interval))
+        {
+            RCLCPP_INFO(logger, "✅ Service %s is now available.", service_name.c_str());
+            return true;
+        }
+        RCLCPP_WARN(logger, "⏳ Waiting for service %s...", service_name.c_str());
+    }
+    RCLCPP_ERROR(logger, "❌ Service %s not available after timeout.", service_name.c_str());
+    return false;
+}
+
+// === Generic wrapper for async service calls ===
+template <typename ServiceT>
+bool callServiceAsync(rclcpp::Node *node,
+                      typename rclcpp::Client<ServiceT>::SharedPtr &client,
+                      const std::string &service_name,
+                      std::function<void(typename rclcpp::Client<ServiceT>::SharedFuture)> callback = nullptr,
+                      std::chrono::seconds total_timeout = std::chrono::seconds(10),
+                      std::chrono::milliseconds retry_interval = std::chrono::milliseconds(500))
+{
+    // Create client if not exists
+    if (!client)
+    {
+        client = node->create_client<ServiceT>(service_name);
+    }
+
+    // Wait with retry
+    if (!waitForServiceWithRetry(client, total_timeout, retry_interval, node->get_logger(), service_name))
+    {
+        return false; // timeout
+    }
+
+    // Create request
+    auto request = std::make_shared<typename ServiceT::Request>();
+
+    // Async call
+    if (callback)
+    {
+        client->async_send_request(request, callback);
+    }
+    else
+    {
+        (void)client->async_send_request(request); // fire & forget
+    }
+
+    RCLCPP_INFO(node->get_logger(), "📨 Sent request to %s", service_name.c_str());
+    return true;
+}
+
+bool attemptPlan(moveit::planning_interface::MoveGroupInterface &move_group,
+                 moveit::planning_interface::MoveGroupInterface::Plan &plan,
+                 int max_attempts,
+                 const std::string &context_label,
+                 const rclcpp::Logger &logger)
+{
+    for (int i = 1; i <= max_attempts; ++i)
+    {
+        RCLCPP_INFO(logger, "🌀 [%s] Attempt %d/%d: planning...", context_label.c_str(), i, max_attempts);
+
+        if (move_group.plan(plan) == moveit::planning_interface::MoveItErrorCode::SUCCESS)
+        {
+            RCLCPP_INFO(logger, "✅ [%s] Planning succeeded on attempt %d.", context_label.c_str(), i);
+            return true;
+        }
+
+        RCLCPP_WARN(logger, "⚠️ [%s] Planning attempt %d failed.", context_label.c_str(), i);
+        // rclcpp::sleep_for(std::chrono::milliseconds(200)); // optional small pause
+    }
+
+    RCLCPP_WARN(logger, "❌ [%s] All %d planning attempts failed.", context_label.c_str(), max_attempts);
+    return false;
+}
+
+double attemptCartesianPath(moveit::planning_interface::MoveGroupInterface &move_group,
+                            const std::vector<geometry_msgs::msg::Pose> &waypoints,
+                            double eef_step, double jump_threshold,
+                            moveit_msgs::msg::RobotTrajectory &traj,
+                            bool avoid_collisions,
+                            int max_attempts,
+                            const std::string &context_label,
+                            const rclcpp::Logger &logger)
+{
+    double fraction = 0.0;
+    for (int i = 1; i <= max_attempts; ++i)
+    {
+        RCLCPP_INFO(logger, "🌀 [%s] Attempt %d/%d: computing Cartesian path...", context_label.c_str(), i, max_attempts);
+
+        fraction = move_group.computeCartesianPath(waypoints, eef_step, jump_threshold, traj, avoid_collisions);
+
+        if (fraction > 0.8)
+        {
+            RCLCPP_INFO(logger, "✅ [%s] Cartesian path succeeded on attempt %d (%.2f%%).",
+                        context_label.c_str(), i, fraction * 100.0);
+            return fraction;
+        }
+
+        RCLCPP_WARN(logger, "⚠️ [%s] Attempt %d failed (%.2f%%).", context_label.c_str(), i, fraction * 100.0);
+        rclcpp::sleep_for(std::chrono::milliseconds(200));
+    }
+
+    RCLCPP_WARN(logger, "❌ [%s] All %d Cartesian path attempts failed (%.2f%% best).",
+                context_label.c_str(), max_attempts, fraction * 100.0);
+    return fraction;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+class MotionPlanning2PhasesNode : public rclcpp::Node
+{
+public:
+    ///////////////////////////////////////Class Definition & State Machine//////////////////////////////////////////////
+    enum RobotState
+    {
+        STATE_WAITING_FOR_USER,
+        STATE_MOVING_BUNKER,
+        STATE_CHECK_HOME,
+        STATE_WAITING_FOR_TARGET,
+        STATE_PLANNING_MOTION,
+        STATE_EXECUTING_PLAN,
+        STATE_GRIPPER_CONTROL
+    };
+
+    enum CameraSource
+    {
+        CAMERA_KINECT,
+        CAMERA_REALSENSE
+    };
+
+    /////////////////////////////////////////CONSTRUCTOR////////////////////////////////////////////
+    explicit MotionPlanning2PhasesNode(const rclcpp::NodeOptions &options = rclcpp::NodeOptions())
+        : Node("motion_planning_2phases_node", options),
+          current_state_(STATE_WAITING_FOR_USER),
+          next_state_(STATE_WAITING_FOR_USER),
+          motion_planning_stage_(0),
+          connect_bunker_(true),
+          last_kinect_detection_time_(rclcpp::Time(0, 0, this->get_clock()->get_clock_type())),   // This creates a ROS2 timestamp
+          last_realsense_detection_time_(rclcpp::Time(0, 0, this->get_clock()->get_clock_type())) // This creates a ROS2 timestamp
+
+    {
+        RCLCPP_INFO(this->get_logger(), "Motion Planning 2 Phases node initialized.");
+
+        //////////////////////////DEFINE DEFAULT PARAMETERS///////////////////////////////////////////////////////
+        this->declare_parameter("planning_group", "xarm7");
+        this->declare_parameter("planning_time", 5.0);
+        this->declare_parameter("default_velocity_scaling_factor", 0.35);
+        this->declare_parameter("default_acceleration_scaling_factor", 0.25);
+        this->declare_parameter("num_planning_attempts", 5);
+        this->declare_parameter("cartesian_velocity_scaling_factor", 0.1);
+        this->declare_parameter("cartesian_acceleration_scaling_factor", 0.1);
+        this->declare_parameter("cartesian_time_scaling_factor", 7.0);
+        this->declare_parameter("cartesian_step_size", 0.01);
+        this->declare_parameter("cartesian_jump_threshold", 0.0);
+        this->declare_parameter("avoid_collisions", true);
+        this->declare_parameter("grasp_attempt_limit", -1); // -1 = unlimited
+
+        // Approach offset
+        this->declare_parameter("approach_distance", -0.17);
+
+        // Grapsing insertion depth
+        this->declare_parameter("grasping_depth", 0.1);
+
+        // DRL Pose offset
+        this->declare_parameter("stop_distance_before_target", -0.02);
+
+        // Bunker Connection
+        this->declare_parameter("connect_bunker", true);
+        this->declare_parameter("bunker_ip", "192.168.1.100");
+        this->declare_parameter("bunker_port", 8080);
+
+        // Get parameter values
+        planning_group_ = this->get_parameter("planning_group").as_string();
+        planning_time_ = this->get_parameter("planning_time").as_double();
+        default_velocity_scaling_ = this->get_parameter("default_velocity_scaling_factor").as_double();
+        defualt_acceleration_scaling_ = this->get_parameter("default_acceleration_scaling_factor").as_double();
+        planning_attempts_ = this->get_parameter("num_planning_attempts").as_int();
+        approach_distance_ = this->get_parameter("approach_distance").as_double();
+        stop_distance_before_target_ = this->get_parameter("stop_distance_before_target").as_double();
+        grasping_depth_ = this->get_parameter("grasping_depth").as_double();
+        cartesian_time_scaling_factor_ = this->get_parameter("cartesian_time_scaling_factor").as_double();
+        cartesian_velocity_scaling_ = this->get_parameter("cartesian_velocity_scaling_factor").as_double();
+        cartesian_acceleration_scaling_ = this->get_parameter("cartesian_acceleration_scaling_factor").as_double();
+        cart_step_size_ = this->get_parameter("cartesian_step_size").as_double();
+        cart_jump_threshold_ = this->get_parameter("cartesian_jump_threshold").as_double();
+        avoid_collisions_ = this->get_parameter("avoid_collisions").as_bool();
+        grasp_attempt_limit_ = this->get_parameter("grasp_attempt_limit").as_int();
+        connect_bunker_ = this->get_parameter("connect_bunker").as_bool();
+        bunker_ip_ = this->get_parameter("bunker_ip").as_string();
+        bunker_port_ = this->get_parameter("bunker_port").as_int();
+
+        //////////////////////////////////LOAD KINEMATICS CONFIGURATIONS////////////////////////////////////////////////
+        loadKinematicsConfig();
+
+        ////////////////////////////////////////DEFINE HOME POSITION JOINT VALUES////////////////////////////////////////
+        home_joint_values_ = {0.0, 0.0, 0.0, 0.0, 0.0, -1.5708, 0.0};
+        home_joint_names_ = {"joint1", "joint2", "joint3", "joint4", "joint5", "joint6", "joint7"};
+        home_position_tolerance_ = 0.05; // radians
+
+        ////////////////////////INITIALIZE DEFAULT ORIENTATION (FORWARD-FACING GRIPPER)//////////////////////////////////
+        // Gripper pose - Forward
+        tf2::Quaternion default_quat(0, 0, 0, 1);
+        default_quat.normalize();
+        default_orientation_ = tf2::toMsg(default_quat);
+
+        // Gripper pose - Grasp pose, face up
+        tf2::Quaternion grasp2_quat(-0.68146, -0.16862, -0.17098, 0.69116);
+        grasp2_quat.normalize();
+        grasp2_orientation_ = tf2::toMsg(grasp2_quat);
+
+        // Gripper pose - Grasp pose, straight
+        tf2::Quaternion grasp1_quat(-0.7071, 0, 0, 0.7071);
+        grasp1_quat.normalize();
+        grasp1_orientation_ = tf2::toMsg(grasp1_quat);
+
+        // Gripper pose - 2nd trial if 1st fail
+        tf2::Quaternion grasp3_quat(0, 0, 0, 1);
+        grasp3_quat.normalize();
+        grasp3_orientation_ = tf2::toMsg(grasp3_quat);
+
+        ////////////////////////INITIALIZE UPWARD ORIENTATION (+15° pitch)//////////////////////////////////
+        double pitch_deg = -15.0;
+        double pitch_rad = pitch_deg * M_PI / 180.0; // convert degrees to radians
+
+        // Rotation about Y-axis (pitch)
+        tf2::Quaternion upward_quat;
+        upward_quat.setRPY(0.0, pitch_rad, 0.0);
+        upward_quat.normalize();
+        upwards_orientation_ = tf2::toMsg(upward_quat);
+    }
+
+    /////////////////////////////////////////INTITIALIZATION METHOD//////////////////////////////////////////////////////
+    void
+    init()
+    {
+        /////////////////////////////INITIALIZE MOVEIT INTERFACE//////////////////////////////////////////
+        // Wait for /move_group parameter service
+        auto param_client = std::make_shared<rclcpp::SyncParametersClient>(this, "move_group");
+        while (!param_client->wait_for_service(std::chrono::seconds(1)))
+        {
+            RCLCPP_INFO(this->get_logger(), "⏳ Waiting for /move_group parameter service...");
+        }
+
+        // Keep polling until both parameters exist
+        std::string urdf, srdf;
+        while (urdf.empty() || srdf.empty())
+        {
+            try
+            {
+                urdf = param_client->get_parameter<std::string>("robot_description");
+                srdf = param_client->get_parameter<std::string>("robot_description_semantic");
+            }
+            catch (...)
+            {
+                urdf.clear();
+                srdf.clear();
+            }
+
+            if (urdf.empty() || srdf.empty())
+            {
+                RCLCPP_INFO(this->get_logger(), "⏳ URDF/SRDF not ready yet...");
+                rclcpp::sleep_for(std::chrono::seconds(1));
+            }
+        }
+
+        // Copy parameters locally so MoveGroupInterface can find them
+        this->declare_parameter<std::string>("robot_description", urdf);
+        this->set_parameter(rclcpp::Parameter("robot_description", urdf));
+        this->declare_parameter<std::string>("robot_description_semantic", srdf);
+        this->set_parameter(rclcpp::Parameter("robot_description_semantic", srdf));
+
+        RCLCPP_INFO(this->get_logger(), "✅ URDF & SRDF copied locally.");
+
+        // Initialize MoveGroupInterface AFTER robot model is ready
+        move_group_ = std::make_shared<moveit::planning_interface::MoveGroupInterface>(
+            shared_from_this(), planning_group_);
+
+        move_group_->startStateMonitor();
+        RCLCPP_INFO(this->get_logger(), "Waiting to get state");
+
+        move_group_->setPlanningTime(planning_time_);
+        move_group_->setMaxVelocityScalingFactor(default_velocity_scaling_);
+        move_group_->setNumPlanningAttempts(planning_attempts_);
+        move_group_->setMaxAccelerationScalingFactor(defualt_acceleration_scaling_);
+
+        RCLCPP_INFO(this->get_logger(), "✅ MoveGroupInterface initialized for %s", planning_group_.c_str());
+        RCLCPP_INFO(this->get_logger(), "Planning time set to default: %f", planning_time_);
+        RCLCPP_INFO(this->get_logger(), "Max velocity set to default: %f", default_velocity_scaling_);
+        RCLCPP_INFO(this->get_logger(), "Max acceleration set to default: %f", defualt_acceleration_scaling_);
+        RCLCPP_INFO(this->get_logger(), "End effector link in node: %s", move_group_->getEndEffectorLink().c_str());
+
+        ////////////////////////////////////////////// SUBSCRIBER & PUBLISHER ///////////////////////////////////////////////
+        // Subscriber for approach pose from azure kinect
+        kinect_pose_sub_ = this->create_subscription<geometry_msgs::msg::PoseStamped>(
+            "/kinect/tomato/target_pose",
+            1,
+            std::bind(&MotionPlanning2PhasesNode::KinectPoseCallback, this, std::placeholders::_1));
+
+        // Subscriber for target pose from realsense d435i
+        realsense_pose_sub_ = this->create_subscription<geometry_msgs::msg::PoseStamped>(
+            "/realsense/tomato/target_pose",
+            1,
+            std::bind(&MotionPlanning2PhasesNode::RealsensePoseCallback, this, std::placeholders::_1));
+
+        // Create a timer for state machine processing
+        state_timer_ = this->create_wall_timer(
+            std::chrono::milliseconds(100), // 10Hz state machine update (10 times per seconds)
+            std::bind(&MotionPlanning2PhasesNode::stateMachineCallback, this));
+
+        RCLCPP_INFO(this->get_logger(), "Subscribed to Azure Kinect topic /kinect/tomato/target_pose");
+        RCLCPP_INFO(this->get_logger(), "Subscribed to RealSense topic /tomato/target_pose");
+
+        rs_check_client_ = this->create_client<std_srvs::srv::Trigger>("/realsense/check_tomato_visible");
+
+        grasp_success_service_ = this->create_service<std_srvs::srv::Trigger>(
+            "/grasp_success_check",
+            std::bind(&MotionPlanning2PhasesNode::handleGraspSuccessCheck, this, std::placeholders::_1, std::placeholders::_2));
+
+        // Initialize bunker connection
+        if (connect_bunker_)
+        {
+            bunker_socket_fd_ = socket(AF_INET, SOCK_STREAM, 0);
+            sockaddr_in serv_addr{};
+            serv_addr.sin_family = AF_INET;
+            serv_addr.sin_port = htons(bunker_port_);
+            inet_pton(AF_INET, bunker_ip_.c_str(), &serv_addr.sin_addr);
+
+            if (connect(bunker_socket_fd_, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) >= 0)
+            {
+                bunker_connected_ = true;
+                RCLCPP_INFO(this->get_logger(), "✅ Connected to bunker at %s:%d",
+                            bunker_ip_.c_str(), bunker_port_);
+            }
+            else
+            {
+                RCLCPP_WARN(this->get_logger(), "❌ Failed to connect to bunker base (%s:%d)",
+                            bunker_ip_.c_str(), bunker_port_);
+            }
+        }
+
+        RCLCPP_INFO(this->get_logger(), "Setup complete, state machine will determine next action");
+    }
+
+private:
+    ////////////////////////////////////////// GLOBAL VARIABLES/FLAG/PARAMETERS //////////////////////////////////////////////////
+    std::shared_ptr<moveit::planning_interface::MoveGroupInterface> move_group_;
+    rclcpp::TimerBase::SharedPtr state_timer_;
+    std::vector<rclcpp::TimerBase::SharedPtr> delayed_timers_;
+    std::string planning_group_;
+    geometry_msgs::msg::Pose last_known_end_pose_;
+
+    // Subscribers and Publishers
+    rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr kinect_pose_sub_;
+    rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr realsense_pose_sub_;
+
+    // Gripper client
+    rclcpp::Client<std_srvs::srv::Empty>::SharedPtr open_client_;
+    rclcpp::Client<std_srvs::srv::Empty>::SharedPtr close_client_;
+
+    // Post grasp grasp success check service/client
+    rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr rs_check_client_;
+    rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr grasp_success_service_;
+
+    // State machine variables
+    RobotState current_state_;
+    RobotState next_state_;
+    std::mutex state_mutex_;
+
+    // Camera Related
+    std::queue<geometry_msgs::msg::PoseStamped> kinect_target_pose_queue_;
+    std::queue<geometry_msgs::msg::PoseStamped> realsense_target_pose_queue_;
+    std::mutex target_queue_mutex_;
+    std::mutex camera_queue_mutex_;
+    geometry_msgs::msg::PoseStamped kinect_target_;
+    geometry_msgs::msg::PoseStamped approach_pose_;
+    geometry_msgs::msg::PoseStamped realsense_target_;
+    geometry_msgs::msg::Pose target_contact_pose_;
+    CameraSource active_camera_ = CAMERA_KINECT; // For switching camera
+
+    // Task customized flags and counters
+    bool gripper_service_called_ = false;
+    bool grasp_success_ = false;
+    int grasp_attempt_count_ = 0;
+    int success_count_ = 0;        // To calculated success rate
+    int grasp_attempt_limit_ = -1; // -1 means "no limit" (infinite loop)
+    int planning_attempts_;
+    int motion_planning_stage_ = 0;
+    bool error_flag_ = false;
+    bool attempt2_ = false;
+    int fail_threshold_ = 3; // <-- adjustable
+
+
+    // Home position configuration
+    std::vector<double> home_joint_values_;
+    std::vector<std::string> home_joint_names_;
+    double home_position_tolerance_;
+    geometry_msgs::msg::Quaternion default_orientation_;
+    geometry_msgs::msg::Quaternion upwards_orientation_;
+    geometry_msgs::msg::Quaternion grasp1_orientation_;
+    geometry_msgs::msg::Quaternion grasp2_orientation_;
+    geometry_msgs::msg::Quaternion grasp3_orientation_;
+
+    // Moveit related parameters
+    bool avoid_collisions_;
+    double planning_time_;
+    double defualt_acceleration_scaling_;
+    double default_velocity_scaling_;
+    double cartesian_velocity_scaling_;
+    double cartesian_acceleration_scaling_;
+    double cart_step_size_;
+    double cart_jump_threshold_;
+    double cartesian_time_scaling_factor_;
+    double last_path_fraction_ = 0.0;
+    bool plan_success_ = false;
+    moveit::planning_interface::MoveGroupInterface::Plan current_plan_;
+    std::vector<geometry_msgs::msg::Pose> cartesian_waypoints_;
+
+    // external planning retry
+    int max_plan_attempts_ = 3; // external retries before declaring failure
+
+    // Custom Offset
+    double approach_distance_;
+    double stop_distance_before_target_;
+    double grasping_depth_;
+
+    // Bunker TCP client
+    int bunker_socket_fd_ = -1;
+    std::string bunker_ip_;
+    int bunker_port_;
+    bool connect_bunker_ = true;
+    bool bunker_connected_;
+    bool bunker_moving_ = false;
+    int fail_count_ = 0;
+    bool move_due_to_fail_ = false;
+
+    // Kinect detection timing
+    rclcpp::Time last_kinect_detection_time_;
+    rclcpp::Time last_realsense_detection_time_;
+    int kinect_no_detection_counter_ = 0;
+    const int KINECT_NO_DETECTION_LIMIT_ = 3;   // 30 ticks = 3 seconds at 10 Hz
+    int realsense_no_detection_counter_ = 0;
+    const int REALSENSE_NO_DETECTION_LIMIT_ = 4;   // 30 ticks = 3 seconds at 10 Hz
+
+    bool waiting_for_target_entered_ = false;
+
+    void setState(RobotState new_state)
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        next_state_ = new_state;
+    }
+    RobotState getState()
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        return current_state_;
+    }
+    void updateState()
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        if (current_state_ != next_state_)
+        {
+            RCLCPP_INFO(this->get_logger(), "State transition: %d -> %d",
+                        static_cast<int>(current_state_), static_cast<int>(next_state_));
+            current_state_ = next_state_;
+        }
+    }
+
+    void loadKinematicsConfig()
+    {
+        const std::string prefix = "robot_description_kinematics." + planning_group_;
+
+        // Keep existing values
+        this->declare_parameter(prefix + ".kinematics_solver", "kdl_kinematics_plugin/KDLKinematicsPlugin");
+        this->declare_parameter(prefix + ".kinematics_solver_search_resolution", 0.005);
+        this->declare_parameter(prefix + ".kinematics_solver_timeout", 1.0);
+        this->declare_parameter(prefix + ".kinematics_solver_attempts", 10);
+        this->declare_parameter(prefix + ".position_only_ik", false);
+        this->declare_parameter(prefix + ".tip_link", "center_tip"); // Preserve the correct TCP
+
+        RCLCPP_INFO(this->get_logger(), "Using kinematics solver: %s, tip link: %s",
+                    this->get_parameter(prefix + ".kinematics_solver").as_string().c_str(),
+                    this->get_parameter(prefix + ".tip_link").as_string().c_str());
+        RCLCPP_INFO(this->get_logger(), "Kinematics configuration loaded successfully");
+    }
+
+    void resetAllFlags()
+    {
+        motion_planning_stage_ = 0;
+        plan_success_ = false;
+        gripper_service_called_ = false;
+        grasp_success_ = false;
+        grasp_attempt_count_ = 0;
+        success_count_ = 0;
+        grasp_attempt_limit_ = -1;
+        error_flag_ = false;
+
+        // --- Bunker-related resets ---
+        bunker_moving_ = false;
+        active_camera_ = CAMERA_KINECT;
+        RCLCPP_INFO(this->get_logger(), "🚧 Bunker state reset: stopped, timer cleared.");
+    }
+
+    ///////////////////////////////////////////////////////// BUNKER ///////////////////////////////////////////////////////////////
+    void baseMotion(int cmd)
+    {
+        if (!bunker_connected_)
+        {
+            RCLCPP_WARN(this->get_logger(), "🚫 Bunker not connected!");
+            return;
+        }
+
+        std::string message;
+        switch (cmd)
+        {
+        case 8: // Forward
+            message = "Move";
+            break;
+        case 5: // Stop
+            message = "Stop";
+            break;
+        case 4: // Left
+            message = "Left";
+            break;
+        case 6: // Right
+            message = "Right";
+            break;
+        case 2: // Back
+            message = "Back";
+            break;
+        default:
+            RCLCPP_WARN(this->get_logger(), "⚠️ Invalid bunker cmd: %d → default Stop", cmd);
+            message = "Stop";
+            break;
+        }
+
+        // Send
+        ssize_t bytes_sent = send(bunker_socket_fd_, message.c_str(), message.size(), 0);
+        if (bytes_sent < 0)
+        {
+            RCLCPP_ERROR(this->get_logger(), "❌ Failed to send bunker command.");
+            return;
+        }
+
+        // Optional read-back (like old Python response)
+        char buffer[1024] = {0};
+        ssize_t bytes_recv = recv(bunker_socket_fd_, buffer, sizeof(buffer) - 1, MSG_DONTWAIT);
+        if (bytes_recv > 0)
+        {
+            buffer[bytes_recv] = '\0';
+            RCLCPP_INFO(this->get_logger(), "📨 Bunker replied: %s", buffer);
+        }
+        else
+        {
+            RCLCPP_DEBUG(this->get_logger(), "📭 No bunker reply (non-blocking).");
+        }
+
+        RCLCPP_INFO(this->get_logger(), "✅ Sent bunker cmd: %s", message.c_str());
+    }
+
+    void handleBunkerMovement() // move bunker and back to STATE_WAITING_FOR_TARGET for kinect target
+    {
+        RobotState st = getState();
+        if (st != STATE_MOVING_BUNKER)
+        {   
+            RCLCPP_WARN(this->get_logger(), "not in bunker state.");
+            return;
+        }
+        if (!connect_bunker_ || !bunker_connected_)
+        {
+            RCLCPP_WARN(this->get_logger(), "🚫 Bunker not connected or disabled.");
+            setState(STATE_WAITING_FOR_USER);
+            return;
+        }
+
+        if (!bunker_moving_)
+        {
+            RCLCPP_WARN(this->get_logger(), "moving bunker forward.");
+            baseMotion(8); // forward
+            bunker_moving_ = true;
+            if (move_due_to_fail_) // this is specially for if continuosly fail 3 times, move bunker
+            {
+                rclcpp::sleep_for(std::chrono::milliseconds(3000));
+                move_due_to_fail_ = false;
+            }
+            waiting_for_target_entered_ = false;
+            last_kinect_detection_time_ = this->now();
+            last_realsense_detection_time_ = this->now();
+            RCLCPP_INFO(this->get_logger(), "🕒 Stampped time once");
+            active_camera_ = CAMERA_KINECT;
+            clearKinectCameraQueue();
+            setState(STATE_WAITING_FOR_TARGET);
+        }
+    }
+
+    ///////////////////////////////////////////////////// CHECK GRASP LIMIT ///////////////////////////////////////////////////////
+    bool checkGraspAttemptLimit()
+    {
+        RCLCPP_INFO(this->get_logger(),
+                    "\n== Checking Grasp Attempt ==\n🎯 Attempt %d of %d (success count=%d)",
+                    grasp_attempt_count_, grasp_attempt_limit_, success_count_);
+
+        // --- compute failed attempts
+        RCLCPP_INFO(this->get_logger(),
+                    "fail_count_ = %d", fail_count_);
+
+        // --- If limit reached → end run completely
+        if (grasp_attempt_limit_ > 0 && grasp_attempt_count_ >= grasp_attempt_limit_)
+        {
+            RCLCPP_WARN(this->get_logger(),
+                        "\n🎯 Max grasp attempt limit reached");
+            return true; // stop everything, handled by caller
+        }
+
+
+        else
+            return false;
+    }
+
+    ///////////////////////////////////////////////////// CHECK HOME POSITION ////////////////////////////////////////////////////////
+
+    bool isAtHomePosition()
+    {
+        RCLCPP_INFO(this->get_logger(), "\n🟢CURRENT STATE: CHECK HOME.\n🔵 In isAtHomePosition()\n");
+        try
+        {
+            moveit::core::RobotStatePtr current_state = move_group_->getCurrentState(2.0); // wait up to 2s
+            if (!current_state)
+            {
+                RCLCPP_WARN(this->get_logger(), "\n❌ Timed out waiting for robot current state.\n🟡 NEXT STATE: WAITING FOR USER");
+                setState(STATE_WAITING_FOR_USER);
+                return false;
+            }
+
+            // make a copu of current joint values & check if at home position
+            std::vector<double> current_joint_values;
+            current_state->copyJointGroupPositions("xarm7", current_joint_values);
+
+            for (size_t i = 0; i < current_joint_values.size(); ++i)
+            {
+                RCLCPP_INFO(this->get_logger(), "[%s] current: %.6f | home: %.6f | diff: %.6f",
+                            home_joint_names_[i].c_str(),
+                            current_joint_values[i],
+                            home_joint_values_[i],
+                            std::abs(current_joint_values[i] - home_joint_values_[i]));
+                if (std::abs(current_joint_values[i] - home_joint_values_[i]) > home_position_tolerance_)
+                {
+                    RCLCPP_INFO(this->get_logger(), "\n❌ Joint %s is NOT at home position (tolerance exceeded).\n🟡 NEXT STATE: PLANNING MOTION (HOME)",
+                                home_joint_names_[i].c_str());
+                    return false;
+                }
+            }
+
+            RCLCPP_INFO(this->get_logger(), "\n✅ Xarm is at home position\n🟡 NEXT STATE: WAITING FOR TARGET (KINECT)");
+            return true;
+        }
+        catch (const std::exception &e)
+        {
+            RCLCPP_WARN(this->get_logger(), "\n❌ Error while checking home position: %s.\n🟡 NEXT STATE: WAITING FOR USER", e.what());
+            setState(STATE_WAITING_FOR_USER);
+            return false;
+        }
+    }
+
+    // === Stage 0: Home ===
+    void planToHomePosition()
+    {
+        RCLCPP_INFO(this->get_logger(), "\n🟢CURRENT STATE: PLANNING MOTION (HOME) (Stage %d)\n🔵 In planToHomePosition()", motion_planning_stage_);
+
+        move_group_->setStartStateToCurrentState();
+        move_group_->setMaxVelocityScalingFactor(default_velocity_scaling_);
+        move_group_->setMaxAccelerationScalingFactor(defualt_acceleration_scaling_);
+        move_group_->setJointValueTarget(home_joint_values_);
+
+        // plan_success_ = (move_group_->plan(current_plan_) ==
+        //                  moveit::planning_interface::MoveItErrorCode::SUCCESS);
+        plan_success_ = attemptPlan(*move_group_, current_plan_, max_plan_attempts_, "Home", this->get_logger());
+
+        if (plan_success_)
+        {
+            RCLCPP_INFO(this->get_logger(), "\n✅ Planning to home success.\n🟡 NEXT STATE: EXECUTING PLAN (Stage %d)", motion_planning_stage_);
+            setState(STATE_EXECUTING_PLAN);
+        }
+        else
+        {
+            RCLCPP_ERROR(this->get_logger(), "\n❌ Failed to plan home position\n🟡 NEXT STATE: STATE_WAITING_FOR_USER");
+            resetAllFlags();
+            setState(STATE_WAITING_FOR_USER);
+            publishResult(false);
+        }
+    }
+
+    // === Stage 1: Kinect Approach ===
+    void planToApproachPosition()
+    {
+        RCLCPP_INFO(this->get_logger(), "\n🟢CURRENT STATE: PLANNING MOTION (APPROACH) (Stage %d, Kinect)\n🔵 In planToApproachPosition()", motion_planning_stage_);
+
+        move_group_->setStartStateToCurrentState();
+
+        approach_pose_ = kinect_target_;
+        approach_pose_.pose.position.x += approach_distance_; // 30cm from realsense d435i
+        approach_pose_.pose.orientation = default_orientation_;
+
+        move_group_->setPoseTarget(approach_pose_.pose);
+
+        // plan_success_ = (move_group_->plan(current_plan_) == moveit::planning_interface::MoveItErrorCode::SUCCESS);
+        plan_success_ = attemptPlan(*move_group_, current_plan_, max_plan_attempts_, "Approach", this->get_logger());
+
+        if (plan_success_)
+        {
+            RCLCPP_INFO(this->get_logger(), "\n✅ Planning to approach success.\n🟡 NEXT STATE: EXECUTING PLAN (Stage %d)", motion_planning_stage_);
+            setState(STATE_EXECUTING_PLAN);
+        }
+        else
+        {
+            RCLCPP_WARN(this->get_logger(), "\n❌ Plan to approach failed → retry");
+            // error_flag_ = true;
+            fail_count_++;
+            motion_planning_stage_ = 0;
+            setState(STATE_CHECK_HOME);
+            publishResult(false);
+        }
+    }
+
+    // === Stage 2: Grasp  ===
+    void planToGraspPosition()
+    {
+        RCLCPP_INFO(this->get_logger(), "\n🟢CURRENT STATE: PLANNING MOTION (GRASP) (Stage %d)\n🔵 In planToGraspPosition()", motion_planning_stage_);
+
+        geometry_msgs::msg::Pose grasp_pose = target_contact_pose_;
+
+        // --- Choose orientation based on height (z) ---
+        if (grasp_pose.position.z < 0.40)
+        {
+            // Use forward-facing orientation for low targets (< 80 cm)
+            grasp_pose.orientation = grasp1_orientation_;
+            RCLCPP_INFO(this->get_logger(),
+                        "🔵 using grasp1_orientation_ (forward)");
+        }
+        else
+        {
+            // Use upward/angled orientation for higher tomatoes
+            grasp_pose.orientation = grasp2_orientation_;
+            grasp_pose.position.z += -0.035;
+            grasp_pose.position.x += +0.01;
+            RCLCPP_INFO(this->get_logger(),
+                        "🔵 Grasp pose z = %.3f m → using grasp2_orientation_ (upward)",
+                        grasp_pose.position.z);
+        }
+
+        if (attempt2_) // if previously fail one time
+        {
+            grasp_pose.orientation = grasp3_orientation_;
+            RCLCPP_INFO(this->get_logger(),
+                        "🔵 Overide previous Grasp pose\nusing grasp3_orientation_ (horizontal for 2nd attempt)");
+            attempt2_ = false;
+        }
+
+        // grasp_pose.orientation = default_orientation_;
+
+        // === Apply predefined offsets ===
+        grasp_pose.position.x += stop_distance_before_target_;
+        // grasp_pose.position.y += camera_horizontal_offset_from_eef_;
+
+        // === Compute insertion pose ===
+        Eigen::Quaterniond q(grasp_pose.orientation.w,
+                             grasp_pose.orientation.x,
+                             grasp_pose.orientation.y,
+                             grasp_pose.orientation.z);
+
+        Eigen::Vector3d local_offset(grasping_depth_, 0.0, 0.0);
+        Eigen::Vector3d world_offset = q * local_offset;
+
+        geometry_msgs::msg::Pose insertion_pose = grasp_pose;
+        insertion_pose.position.x += world_offset.x();
+        insertion_pose.position.y += world_offset.y();
+        insertion_pose.position.z += world_offset.z();
+
+        // === Cartesian waypoints ===
+        cartesian_waypoints_.clear();
+        cartesian_waypoints_.push_back(grasp_pose);
+        cartesian_waypoints_.push_back(insertion_pose);
+
+        rclcpp::sleep_for(std::chrono::milliseconds(500));
+        move_group_->setStartStateToCurrentState();
+
+        moveit_msgs::msg::RobotTrajectory traj;
+        // double fraction = move_group_->computeCartesianPath(
+        //     cartesian_waypoints_, cart_step_size_, cart_jump_threshold_,
+        //     traj, avoid_collisions_);
+
+        double fraction = attemptCartesianPath(
+            *move_group_, cartesian_waypoints_, cart_step_size_,
+            cart_jump_threshold_, traj, avoid_collisions_,
+            max_plan_attempts_, "Grasp", this->get_logger());
+
+        if (fraction > 0.8)
+        {
+            current_plan_ = moveit::planning_interface::MoveGroupInterface::Plan();
+            current_plan_.trajectory_ = traj;
+
+            // === Retiming for smooth execution ===
+            moveit::core::RobotStatePtr current_state = move_group_->getCurrentState();
+            robot_trajectory::RobotTrajectory rt(move_group_->getRobotModel(), move_group_->getName());
+            rt.setRobotTrajectoryMsg(*current_state, current_plan_.trajectory_);
+
+            trajectory_processing::IterativeParabolicTimeParameterization iptp;
+            if (iptp.computeTimeStamps(rt, cartesian_velocity_scaling_, cartesian_acceleration_scaling_))
+            {
+                rt.getRobotTrajectoryMsg(current_plan_.trajectory_);
+                RCLCPP_INFO(this->get_logger(),
+                            "Trajectory retimed (vel=%.2f, acc=%.2f)",
+                            cartesian_velocity_scaling_, cartesian_acceleration_scaling_);
+            }
+            else
+            {
+                RCLCPP_WARN(this->get_logger(),
+                            "⚠️ Time parameterization failed → executing raw trajectory");
+            }
+
+            move_group_->setMaxVelocityScalingFactor(cartesian_velocity_scaling_);
+            move_group_->setMaxAccelerationScalingFactor(cartesian_acceleration_scaling_);
+
+            plan_success_ = true;
+            RCLCPP_INFO(this->get_logger(),
+                        "✅ Grasp + Insertion Cartesian path success (%.2f%% achieved).\n🟡 NEXT STATE: EXECUTING PLAN",
+                        fraction * 100.0);
+            setState(STATE_EXECUTING_PLAN);
+        }
+        else
+        {
+            plan_success_ = false;
+            RCLCPP_ERROR(this->get_logger(),
+                         "❌ Grasp + Insertion Cartesian path failed (%.2f%% achieved).\n🟡 NEXT STATE: CHECK HOME",
+                         fraction * 100.0);
+            // error_flag_ = true;
+            motion_planning_stage_ = 0;
+            setState(STATE_CHECK_HOME);
+        }
+    }
+
+    // === Stage 3: Post-Grasp Retraction ===
+    void planToPostGraspPosition()
+    {
+        RCLCPP_INFO(this->get_logger(), "🟢CURRENT STATE: PLANNING MOTION (POST GRASP) (Stage %d)\n🔵 In  planToPostGraspPosition()", motion_planning_stage_);
+
+        geometry_msgs::msg::Pose current_pose = move_group_->getCurrentPose().pose;
+        geometry_msgs::msg::Pose retract_pose = current_pose;
+        retract_pose.position.x -= 0.12;
+
+        cartesian_waypoints_.clear();
+        cartesian_waypoints_.push_back(current_pose);
+        cartesian_waypoints_.push_back(retract_pose);
+
+        rclcpp::sleep_for(std::chrono::milliseconds(500));
+        move_group_->setStartStateToCurrentState();
+
+        moveit_msgs::msg::RobotTrajectory traj;
+        // double fraction = move_group_->computeCartesianPath(
+        //     cartesian_waypoints_, cart_step_size_, cart_jump_threshold_,
+        //     traj, avoid_collisions_);
+
+        double fraction = attemptCartesianPath(
+            *move_group_, cartesian_waypoints_, cart_step_size_,
+            cart_jump_threshold_, traj, avoid_collisions_,
+            max_plan_attempts_, "PostGrasp", this->get_logger());
+
+        if (fraction > 0.8)
+        {
+            current_plan_ = moveit::planning_interface::MoveGroupInterface::Plan();
+            current_plan_.trajectory_ = traj;
+
+            // === Retiming ===
+            moveit::core::RobotStatePtr current_state = move_group_->getCurrentState();
+            robot_trajectory::RobotTrajectory rt(move_group_->getRobotModel(), move_group_->getName());
+            rt.setRobotTrajectoryMsg(*current_state, current_plan_.trajectory_);
+
+            trajectory_processing::IterativeParabolicTimeParameterization iptp;
+            if (iptp.computeTimeStamps(rt, cartesian_velocity_scaling_, cartesian_acceleration_scaling_))
+            {
+                rt.getRobotTrajectoryMsg(current_plan_.trajectory_);
+                RCLCPP_INFO(this->get_logger(),
+                            "Trajectory retimed (vel=%.2f, acc=%.2f)",
+                            cartesian_velocity_scaling_, cartesian_acceleration_scaling_);
+            }
+            else
+            {
+                RCLCPP_WARN(this->get_logger(),
+                            "⚠️ Time parameterization failed → executing raw trajectory");
+            }
+
+            move_group_->setMaxVelocityScalingFactor(cartesian_velocity_scaling_);
+            move_group_->setMaxAccelerationScalingFactor(cartesian_acceleration_scaling_);
+
+            plan_success_ = true;
+            RCLCPP_INFO(this->get_logger(),
+                        "✅ Post-Grasp retraction success (%.2f%% achieved).",
+                        fraction * 100.0);
+            setState(STATE_EXECUTING_PLAN);
+        }
+        else
+        {
+            plan_success_ = false;
+            RCLCPP_ERROR(this->get_logger(),
+                         "❌ Post-Grasp retraction failed (%.2f%% achieved).",
+                         fraction * 100.0);
+            // error_flag_ = true;
+            motion_planning_stage_ = 0;
+            setState(STATE_CHECK_HOME);
+        }
+    }
+
+    // === Execute Plan ===
+    void executeCurrentPlan()
+    {
+        RCLCPP_INFO(this->get_logger(), "\n🟢CURRENT STATE: EXECUTING PLAN (Stage %d)\n🔵 In executeCurrentPlan()", motion_planning_stage_);
+
+        if (!plan_success_)
+        {
+            RCLCPP_ERROR(this->get_logger(), "\n❌ No plan to execute\n🟡 NEXT STATE: CHECK HOME");
+            // error_flag_ = true;
+            motion_planning_stage_ = 0;
+            publishResult(false);
+            setState(STATE_CHECK_HOME);
+            return;
+        }
+
+        // Apply scaling only when not already retimed
+        if (motion_planning_stage_ == 2 || motion_planning_stage_ == 3)
+        {
+            RCLCPP_INFO(this->get_logger(), "\nStage %d → Using pre-retimed trajectory", motion_planning_stage_);
+        }
+        else
+        {
+            move_group_->setMaxVelocityScalingFactor(default_velocity_scaling_);
+            RCLCPP_INFO(this->get_logger(),
+                        "Using default velocity scaling: %.4f (Stage %d)",
+                        default_velocity_scaling_, motion_planning_stage_);
+        }
+
+        // Execute
+        auto code = move_group_->execute(current_plan_);
+
+        if (code != moveit::planning_interface::MoveItErrorCode::SUCCESS)
+        {
+            RCLCPP_WARN(this->get_logger(),
+                        "\n❌ Execution failed\n🟡 NEXT STATE: CHECK HOME");
+            // error_flag_ = true;
+            motion_planning_stage_ = 0;
+            publishResult(false);
+            setState(STATE_CHECK_HOME);
+            return;
+        }
+
+        RCLCPP_INFO(this->get_logger(), "✅ Execution succeeded.");
+
+        /////////////////////// === Stage progression === ///////////////////////////
+        switch (motion_planning_stage_)
+        {
+        case 0: // Home → Kinect
+            RCLCPP_INFO(this->get_logger(), "\n✅ Home motion completed");
+
+            if (error_flag_)
+            {
+                RCLCPP_WARN(this->get_logger(), "\n❌ Stop flag detected (from previous stage)\n🟡 NEXT STATE: CHECK HOME");
+                setState(STATE_CHECK_HOME);
+                return;
+            }
+
+            RCLCPP_INFO(this->get_logger(), "\n🟣 Opening gripper...");
+            openGripperHomeAsync();
+
+            // RESET ALL NECCEAARY THING
+            grasp_success_ = false;
+            gripper_service_called_ = false;
+            bunker_moving_ = false;
+            waiting_for_target_entered_ = false;
+            last_kinect_detection_time_ = this->now();
+            last_realsense_detection_time_ = this->now();
+            RCLCPP_INFO(this->get_logger(), "🕒 Stampped time once");
+
+            if (checkGraspAttemptLimit())
+            {
+                RCLCPP_INFO(this->get_logger(), "\n🟡 NEXT STATE: WAITING FOR USER");
+                resetAllFlags();
+                setState(STATE_WAITING_FOR_USER);
+                break;
+            }
+
+            // --- If too many consecutive fails → move bunker
+            if (fail_count_ >= fail_threshold_)
+            {
+                RCLCPP_WARN(this->get_logger(),
+                            "🚨 %d consecutive failed grasps → moving bunker to new scene",
+                            fail_count_);
+                move_due_to_fail_ = true;
+                fail_count_ = 0;
+                bunker_moving_ = false;
+
+                setState(STATE_MOVING_BUNKER);
+                updateState();
+
+                RCLCPP_WARN(this->get_logger(),
+                            "set state to move bunker");
+                handleBunkerMovement();
+                active_camera_ = CAMERA_KINECT;
+                clearKinectCameraQueue();
+                
+            }
+
+            motion_planning_stage_ = 1;
+            RCLCPP_INFO(this->get_logger(), "\n🚩 Set motion_planning_stage_ to %d", motion_planning_stage_);
+            active_camera_ = CAMERA_KINECT;
+            RCLCPP_INFO(this->get_logger(), "\n🟣 Switched to Kinect\n🟡 NEXT STATE: WAITING FOR TARGET (KINECT)");
+            clearKinectCameraQueue();
+            setState(STATE_WAITING_FOR_TARGET);
+            // setState(STATE_WAITING_FOR_USER);
+            break;
+
+        case 1: // Kinect → approach position → RealSense
+            rclcpp::sleep_for(std::chrono::milliseconds(1000));
+            RCLCPP_INFO(this->get_logger(),
+                        "\n🟣 Switched to RealSense\n🟡 NEXT STATE: WAITING FOR TARGET (REALSENSE)");
+            active_camera_ = CAMERA_REALSENSE;
+            clearRealsenseCameraQueue();
+            waiting_for_target_entered_ = false;
+            last_kinect_detection_time_ = this->now();
+            last_realsense_detection_time_ = this->now();
+            RCLCPP_INFO(this->get_logger(), "🕒 Stampped time once");
+            setState(STATE_WAITING_FOR_TARGET);
+            // setState(STATE_WAITING_FOR_USER);
+
+            break;
+
+        case 2: // grasp position → gripper
+            RCLCPP_INFO(this->get_logger(), "\n🟡 NEXT STATE: GRIPPER CONTROL");
+            setState(STATE_GRIPPER_CONTROL);
+            // setState(STATE_WAITING_FOR_USER);
+
+            break;
+
+        case 3: // Post-grasp → home
+            RCLCPP_INFO(this->get_logger(), "\n✅ Grasping cycle completed\n🟡 NEXT STATE: CHECK HOME");
+            setState(STATE_CHECK_HOME);
+            // setState(STATE_WAITING_FOR_USER);
+            publishResult(true);
+            break;
+
+        default:
+            motion_planning_stage_++;
+            setState(STATE_PLANNING_MOTION);
+            break;
+        }
+
+        plan_success_ = false;
+    }
+
+    /////////////////////////////////////////////////////////////// CAMERA RELATED //////////////////////////////////////////////
+    void clearRealsenseCameraQueue()
+    {
+        std::queue<geometry_msgs::msg::PoseStamped> empty;
+        std::swap(realsense_target_pose_queue_, empty);
+        RCLCPP_INFO(this->get_logger(), "\n🟣 Cleared RealSense camera pose queue");
+    }
+
+    void clearKinectCameraQueue()
+    {
+        std::queue<geometry_msgs::msg::PoseStamped> empty;
+        std::swap(kinect_target_pose_queue_, empty);
+        RCLCPP_INFO(this->get_logger(), "\n🟣 Cleared Azure Kinect camera pose queue");
+    }
+
+    void KinectPoseCallback(const geometry_msgs::msg::PoseStamped::SharedPtr msg)
+    {
+        RobotState st = getState();
+        if (active_camera_ != CAMERA_KINECT && st != STATE_WAITING_FOR_TARGET)
+            return;
+
+        kinect_target_pose_queue_.push(*msg);      // Save the incoming tomato pose
+        last_kinect_detection_time_ = this->now(); // Records the time of last VALID detection.
+        kinect_no_detection_counter_ = 0;
+        RCLCPP_DEBUG(this->get_logger(), "✅ Valid Kinect detection received. Stampped last_kinect_detection_time_ ");
+
+        if (bunker_moving_)
+        {
+            RCLCPP_INFO(this->get_logger(), "🍅 Tomato detected → stopping bunker.");
+            baseMotion(5);
+            bunker_moving_ = false;
+            rclcpp::sleep_for(std::chrono::milliseconds(1000)); // let bunker fully stop
+            last_kinect_detection_time_ = this->now();
+            last_realsense_detection_time_ = this->now();
+            RCLCPP_INFO(this->get_logger(), "🕒 Stampped time once");
+            waiting_for_target_entered_ = false;
+            active_camera_ = CAMERA_KINECT;
+            clearKinectCameraQueue();
+            setState(STATE_WAITING_FOR_TARGET);
+            return;
+        }
+    }
+
+    void RealsensePoseCallback(const geometry_msgs::msg::PoseStamped::SharedPtr msg)
+    {
+        if (active_camera_ == CAMERA_REALSENSE)
+        {
+            realsense_target_pose_queue_.push(*msg);
+            last_realsense_detection_time_ = this->now();
+        }
+        else
+        {
+            RCLCPP_DEBUG(this->get_logger(),
+                         "Received RealSense pose but active_camera is not REALSENSE, ignoring");
+        }
+    }
+
+    // Add this new helper function in your private section:
+    double getTimeSinceLastKinectDetection()
+    {
+        rclcpp::Time now = this->now();
+        return (now - last_kinect_detection_time_).seconds();
+    }
+
+    // Keep the existing function as-is:
+    bool kinectNoTargetFor(double seconds)
+    {
+        rclcpp::Time now = this->now();
+        double elapsed = (now - last_kinect_detection_time_).seconds();
+        return (elapsed >= seconds);
+    }
+
+    void processNextTargetUnified()
+    {
+
+        ///////////////////////////////////////////////////// KINECT SECTION /////////////////////////////////////////////////////////
+        if (active_camera_ == CAMERA_KINECT)
+        {
+
+            RCLCPP_INFO(this->get_logger(),
+                        "\n🟢 CURRENT STATE: WAITING FOR TARGET"
+                        "\n🟣 ACTIVE CAMERA: KINECT"
+                        "\n🔵 In processNextTargetUnified()");
+
+            // === Check if any tomato target exists in Kinect queue ===
+            if (!kinect_target_pose_queue_.empty())
+            {
+                RCLCPP_INFO(this->get_logger(), "🎯 Kinect target detected");
+
+                // Get newest target
+                kinect_target_ = kinect_target_pose_queue_.front();
+                kinect_target_pose_queue_.pop();
+
+                // Apply default forward orientation for grasp
+                kinect_target_.pose.orientation = default_orientation_;
+                target_contact_pose_ = kinect_target_.pose;
+
+                RCLCPP_INFO(this->get_logger(),
+                            "✅ Using Kinect target:\n"
+                            "   position [x=%.3f, y=%.3f, z=%.3f]",
+                            target_contact_pose_.position.x,
+                            target_contact_pose_.position.y,
+                            target_contact_pose_.position.z);
+
+                // Proceed to planning motion (Stage 1)
+                RCLCPP_INFO(this->get_logger(),
+                            "🟡 NEXT STATE: PLANNING MOTION (Stage %d)",
+                            motion_planning_stage_);
+                last_kinect_detection_time_ = this->now();
+                last_realsense_detection_time_ = this->now();
+                RCLCPP_INFO(this->get_logger(), "🕒 Stampped time once");
+                waiting_for_target_entered_ = false;
+                setState(STATE_PLANNING_MOTION);
+            }
+            // else // Queue is empty
+            // {
+                // // Calculated time difference
+                // double no_det_sec = (this->now() - last_kinect_detection_time_).seconds();
+
+                // if (no_det_sec < 3)
+                // {
+                //     RCLCPP_INFO(this->get_logger(),
+                //                 "⏳ No Kinect detection yet (%.2f s) — waiting, not moving bunker.",
+                //                 no_det_sec);
+                //     return; // <-- DO NOTHING, JUST WAIT
+                // }
+
+                // RCLCPP_INFO(this->get_logger(),
+                //             "   connect_bunker_=%s, bunker_connected_=%s, bunker_moving_=%s",
+                //             connect_bunker_ ? "true" : "false",
+                //             bunker_connected_ ? "true" : "false",
+                //             bunker_moving_ ? "true" : "false");
+
+            else  // Queue is empty
+            {
+                // Increase tick counter whenever scanning and no detection
+                kinect_no_detection_counter_++;
+
+                RCLCPP_INFO(this->get_logger(),
+                            "⏳ No Kinect detection. counter=%d / %d",
+                            kinect_no_detection_counter_, KINECT_NO_DETECTION_LIMIT_);
+
+                // Not enough time passed → keep waiting
+                if (kinect_no_detection_counter_ < KINECT_NO_DETECTION_LIMIT_)
+                    return;
+                if (connect_bunker_ && bunker_connected_ && !bunker_moving_)
+                {
+                    RCLCPP_WARN(this->get_logger(),
+                                "🚀 No tomato detected after 3 s→ moving bunker");
+                    kinect_no_detection_counter_ = 0;
+                    last_kinect_detection_time_ = this->now();
+                    last_realsense_detection_time_ = this->now();
+                    RCLCPP_INFO(this->get_logger(), "🕒 Stampped time once");
+                    waiting_for_target_entered_ = false;
+                    setState(STATE_MOVING_BUNKER);
+                }
+            }
+        }
+
+        /////////////////////////////////////////////////////////// REALSENSE SECTION //////////////////////////////////////////////////
+        else if (active_camera_ == CAMERA_REALSENSE)
+        {
+            RCLCPP_INFO(this->get_logger(),
+                        "\n🟢 CURRENT STATE: WAITING FOR TARGET"
+                        "\n🟣 ACTIVE CAMERA: REALSENSE"
+                        "\n🔵 In processNextTargetUnified()"
+                        "\n🔵 realsense");
+
+            if (!realsense_target_pose_queue_.empty())
+            {
+                // 🟢 Target found → reset timer
+                RCLCPP_INFO(this->get_logger(), "🎯 RealSense target detected");
+
+                // Take the most recent RealSense target
+                realsense_target_ = realsense_target_pose_queue_.front();
+                realsense_target_pose_queue_.pop();
+
+                // Default orientation (no DRL offset yet)
+                realsense_target_.pose.orientation = default_orientation_;
+                target_contact_pose_ = realsense_target_.pose;
+
+                RCLCPP_INFO(this->get_logger(),
+                            "✅ Using RealSense target pose:\n"
+                            "   position [x=%.3f, y=%.3f, z=%.3f]",
+                            target_contact_pose_.position.x,
+                            target_contact_pose_.position.y,
+                            target_contact_pose_.position.z);
+
+                // Go directly to grasp stage
+                motion_planning_stage_ = 2;
+                RCLCPP_INFO(this->get_logger(),
+                            "🟡 NEXT STATE: PLANNING MOTION (Stage %d)",
+                            motion_planning_stage_);
+                setState(STATE_PLANNING_MOTION);
+            }
+
+            // === If no RealSense target found ===
+            // double no_rs_sec = (this->now() - last_realsense_detection_time_).seconds();
+
+            // if (no_rs_sec >= 3)
+            // {
+            //     RCLCPP_WARN(this->get_logger(),
+            //                 "🔴 No RealSense target for %.2f s → returning home & resetting motion planning",
+            //                 no_rs_sec);
+
+            //     motion_planning_stage_ = 0;
+            //     active_camera_ = CAMERA_KINECT; // optional but safer
+            //     clearKinectCameraQueue();
+            //     clearRealsenseCameraQueue();
+            //     waiting_for_target_entered_ = false; // reset timer for Kinect side
+            //     last_kinect_detection_time_ = this->now();
+            //     last_realsense_detection_time_ = this->now();
+            //     RCLCPP_INFO(this->get_logger(), "🕒 Stampped time once");
+            //     setState(STATE_CHECK_HOME);
+            //     return;
+            // }
+            // else
+            // {
+            //     RCLCPP_INFO(this->get_logger(),
+            //                 "⏳ No RealSense detection yet (%.2f s) — waiting...",
+            //                 no_rs_sec);
+            // }
+
+            else  // Queue is empty
+            {
+                // Increase tick counter whenever scanning and no detection
+                realsense_no_detection_counter_++;
+
+                RCLCPP_INFO(this->get_logger(),
+                            "⏳ No Realsense detection. counter=%d / %d",
+                            realsense_no_detection_counter_, REALSENSE_NO_DETECTION_LIMIT_);
+
+                // Not enough time passed → keep waiting
+                if (realsense_no_detection_counter_ < REALSENSE_NO_DETECTION_LIMIT_)
+                    return;
+                realsense_no_detection_counter_ = 0;
+
+                motion_planning_stage_= 0;
+                active_camera_ = CAMERA_KINECT; // optional but safer
+                clearKinectCameraQueue();
+                setState(STATE_CHECK_HOME);
+                
+            }
+        }
+
+        ////////////////////////////////////////////////////////// SAFETY FALLBACK /////////////////////////////////////////////////////
+        else
+        {
+            RCLCPP_ERROR(this->get_logger(),
+                         "❌ Unknown active_camera_ value (%d). Resetting to KINECT.",
+                         static_cast<int>(active_camera_));
+            active_camera_ = CAMERA_KINECT;
+            clearKinectCameraQueue();
+            setState(STATE_WAITING_FOR_TARGET);
+        }
+    }
+
+    ////////////////////////////////////////////////////// GRIPPER CONTROL //////////////////////////////////////////////////////////////
+    // === Full grasp pipeline (async version) ===
+    void callGripperService()
+    {
+        RCLCPP_INFO(this->get_logger(), "🟢 CURRENT STATE: GRIPPER CONTROL\n🔵 In callGripperService()");
+        RCLCPP_INFO(this->get_logger(), "\nStarting grasp attempt..., current grasp_attempt_count_ = %d", grasp_attempt_count_);
+        closeGripperAsync();
+
+    }
+
+    void closeGripperAsync()
+    {
+        using Service = std_srvs::srv::Empty;
+        auto cb = std::bind(&MotionPlanning2PhasesNode::onCloseGripperResponse, this, std::placeholders::_1);
+
+        if (!callServiceAsync<Service>(this,
+                                       close_client_,
+                                       "/gripper/close",
+                                       cb))
+        {
+            RCLCPP_WARN(this->get_logger(), "\n❌ Service /gripper/close not available after timeout");
+            setState(STATE_WAITING_FOR_USER);
+        }
+    }
+
+    // void onCloseGripperResponse(rclcpp::Client<std_srvs::srv::Empty>::SharedFuture future)
+    // {
+    //     (void)future; // response is empty
+    //     RCLCPP_INFO(this->get_logger(), "\n✅ Gripper closed.");
+
+    //     // ✅ Move immediately to motion planning stage 3
+    //     rclcpp::sleep_for(std::chrono::milliseconds(2000));
+    //     gripper_service_called_ = false;
+    //     motion_planning_stage_ = 3;
+    //     RCLCPP_INFO(this->get_logger(), "\n🟡 NEXT STATE: PLANNING MOTION (Stage %d)", motion_planning_stage_);
+    //     setState(STATE_PLANNING_MOTION);
+    // }
+
+    // Integrated gripper grasp success check
+    void onCloseGripperResponse(rclcpp::Client<std_srvs::srv::Empty>::SharedFuture future)
+    {
+        (void)future;
+        RCLCPP_INFO(this->get_logger(), "\n✅ Gripper closed.");
+
+        rclcpp::sleep_for(std::chrono::milliseconds(2000));
+
+        // 🟢 Trigger RealSense grasp success check asynchronously
+        if (!rs_check_client_->wait_for_service(std::chrono::seconds(2)))
+        {
+            RCLCPP_WARN(this->get_logger(),
+                        "❌ /realsense/check_tomato_visible not available — skipping grasp check.");
+            grasp_success_ = false;
+        }
+        else
+        {
+            auto req = std::make_shared<std_srvs::srv::Trigger::Request>();
+
+            // Use async call with lambda callback
+            auto future_result = rs_check_client_->async_send_request(
+                req,
+                [this](rclcpp::Client<std_srvs::srv::Trigger>::SharedFuture result_future)
+                {
+                    auto result = result_future.get();
+                    grasp_success_ = result->success;
+                    if (grasp_success_)
+                    {
+                        RCLCPP_INFO(this->get_logger(),
+                                    "🟢 Grasp check: tomato detected ✅ (%s)",
+                                    result->message.c_str());
+                        success_count_++;
+                    }
+                    else
+                    {
+                        RCLCPP_WARN(this->get_logger(),
+                                    "🔴 Grasp check: no tomato detected ❌ (%s)",
+                                    result->message.c_str());
+                        
+                        fail_count_++;
+                        if(fail_count_%2==0)
+                            attempt2_ = false;
+                        else
+                            attempt2_ = true;
+                    }
+
+                    // Proceed to next stage *after* service reply
+                    rclcpp::sleep_for(std::chrono::milliseconds(1000));
+                    gripper_service_called_ = false;
+                    motion_planning_stage_ = 3;
+                    RCLCPP_INFO(this->get_logger(),
+                                "\n🟡 NEXT STATE: PLANNING MOTION (Stage %d, grasp_success_=%s)",
+                                motion_planning_stage_, grasp_success_ ? "true" : "false");
+                    setState(STATE_PLANNING_MOTION);
+                });
+        }
+
+        // ⚠️ Do NOT block or spin here — let callback above handle continuation
+    }
+
+    // === Stand-alone gripper open service ===
+    void openGripperAsync()
+    {
+        using Service = std_srvs::srv::Empty;
+        auto cb = std::bind(&MotionPlanning2PhasesNode::onOpenGripperResponse, this, std::placeholders::_1);
+
+        if (!callServiceAsync<Service>(this,
+                                       open_client_,
+                                       "/gripper/open",
+                                       cb))
+        {
+            RCLCPP_ERROR(this->get_logger(), "\n❌ Service /gripper/open not available after timeout\n🟡 NEXT STATE: WAITING FOR USER");
+            setState(STATE_WAITING_FOR_USER);
+        }
+    }
+
+    void openGripperHomeAsync()
+    {
+        using Service = std_srvs::srv::Empty;
+        auto cb = std::bind(&MotionPlanning2PhasesNode::onOpenGripperResponse, this, std::placeholders::_1);
+
+        if (!callServiceAsync<Service>(this,
+                                       open_client_,
+                                       "/gripper/open_wide",
+                                       cb))
+        {
+            RCLCPP_ERROR(this->get_logger(), "\n❌ Service /gripper/open not available after timeout\n🟡 NEXT STATE: WAITING FOR USER");
+            setState(STATE_WAITING_FOR_USER);
+        }
+    }
+
+    void onOpenGripperResponse(rclcpp::Client<std_srvs::srv::Empty>::SharedFuture future)
+    {
+        (void)future; // response is empty
+        RCLCPP_INFO(this->get_logger(), "\n✅ Gripper opened.");
+    }
+
+    ///////////////////////////////////////////// CHECK GRASP SUCCESS ////////////////////////////////////////////////////////////////////
+    void handleGraspSuccessCheck(
+        const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
+        std::shared_ptr<std_srvs::srv::Trigger::Response> response)
+    {
+        RCLCPP_INFO(this->get_logger(), "🟠 Checking grasp success via RealSense tomato detection...");
+
+        auto req = std::make_shared<std_srvs::srv::Trigger::Request>();
+        if (!rs_check_client_->wait_for_service(std::chrono::seconds(2)))
+        {
+            RCLCPP_WARN(this->get_logger(), "❌ /realsense/check_tomato_visible service not available!");
+            response->success = false;
+            response->message = "Service unavailable";
+            return;
+        }
+
+        auto future = rs_check_client_->async_send_request(req);
+        if (rclcpp::spin_until_future_complete(this->get_node_base_interface(), future) ==
+            rclcpp::FutureReturnCode::SUCCESS)
+        {
+            auto result = future.get();
+            grasp_success_ = result->success;
+            response->success = grasp_success_;
+            response->message = result->message;
+            RCLCPP_INFO(this->get_logger(), "✅ Grasp success check result: %s", result->message.c_str());
+        }
+        else
+        {
+            RCLCPP_ERROR(this->get_logger(), "⚠️ Failed to call /realsense/check_tomato_visible.");
+            response->success = false;
+            response->message = "Call failed";
+        }
+    }
+
+    ///////////////////////////////////////////// STATE MACHINE ////////////////////////////////////////////////////////////////////
+    void stateMachineCallback()
+    {
+        updateState();
+
+
+        switch (getState())
+        {
+
+        case STATE_WAITING_FOR_USER:
+        {
+            RCLCPP_INFO(this->get_logger(), "\nIN STATE_WAITING_FOR_USER for troubleshooting....");
+
+            std::cout << "\n⚙️ Enter grasp_attempt_limit (ENTER for default 999): ";
+            std::string limit_str;
+            std::getline(std::cin, limit_str);
+
+            if (limit_str.empty())
+            {
+
+                grasp_attempt_limit_ = 999;
+            }
+            else
+            {
+                try
+                {
+
+                    grasp_attempt_limit_ = std::stoi(limit_str);
+                }
+                catch (...)
+                {
+
+                    grasp_attempt_limit_ = 999;
+                }
+            }
+
+            RCLCPP_INFO(this->get_logger(),
+                        "\n✅ grasp_attempt_limit set to %d\n🟡 NEXT STATE: CHECK_HOME",
+                        grasp_attempt_limit_);
+            setState(STATE_CHECK_HOME);
+            break;
+        }
+
+        case STATE_CHECK_HOME:
+        {
+            if (isAtHomePosition())
+            {
+                RCLCPP_INFO(this->get_logger(), "\n✅ Already at home.");
+
+                if (error_flag_)
+                {
+                    RCLCPP_WARN(this->get_logger(),
+                                "\n❌ Error detected previously → Reset all flags\n🟡 NEXT STATE: WAITING_FOR_USER");
+                    resetAllFlags();
+                    setState(STATE_WAITING_FOR_USER);
+                }
+                else
+                {
+                    RCLCPP_INFO(this->get_logger(),
+                                "\n🟣 Switching camera to Kinect\n🟡 NEXT STATE: WAITING_FOR_TARGET");
+                    active_camera_ = CAMERA_KINECT;
+                    clearKinectCameraQueue();
+
+                    setState(STATE_WAITING_FOR_TARGET);
+                }
+            }
+            else
+            {
+                RCLCPP_INFO(this->get_logger(),
+                            "\n🏠 Not at home → planning motion to home position...");
+                motion_planning_stage_ = 0;
+                grasp_attempt_count_++;
+                RCLCPP_INFO(this->get_logger(), "grasp_attempt_count +1");
+                setState(STATE_PLANNING_MOTION);
+            }
+            break;
+        }
+
+        case STATE_WAITING_FOR_TARGET:
+        {
+
+            if (!waiting_for_target_entered_) // is to ensure the timestamp is only reset ONCE every time enter this STATE
+            {
+                // time stamp
+                waiting_for_target_entered_ = true;
+                // last_kinect_detection_time_ = this->now();
+                // last_realsense_detection_time_ = this->now();
+                // RCLCPP_INFO(this->get_logger(), "🕒 Stampped time once");
+            }
+            // Process target every 1 second
+            // state machine runs at 10 Hz (every 100 ms).
+            // But I don’t want to process target detection 10 times per second.
+            static auto last_tick = std::chrono::steady_clock::now();
+            auto now = std::chrono::steady_clock::now();
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_tick).count();
+
+            if (elapsed >= 1000)
+            {
+                last_tick = now;
+
+                processNextTargetUnified();
+            }
+
+            break;
+        
+        }
+
+        case STATE_MOVING_BUNKER:
+        {
+            handleBunkerMovement();
+            break;
+        }
+
+        case STATE_PLANNING_MOTION:
+        {
+            switch (motion_planning_stage_)
+            {
+            case 0:
+                planToHomePosition();
+                break;
+            case 1:
+                planToApproachPosition();
+                break;
+            case 2:
+                planToGraspPosition();
+                break;
+            case 3:
+                planToPostGraspPosition();
+                break;
+            default:
+                RCLCPP_ERROR(this->get_logger(),
+                             "❌ Invalid motion_planning_stage_: %d",
+                             motion_planning_stage_);
+                setState(STATE_CHECK_HOME);
+                break;
+            }
+            break;
+        }
+
+        // ==============================================================
+        // === STATE 4: EXECUTING MOTION PLAN ===========================
+        // ==============================================================
+        case STATE_EXECUTING_PLAN:
+        {
+            executeCurrentPlan();
+            break;
+        }
+
+        // ==============================================================
+        // === STATE 5: GRIPPER CONTROL ================================
+        // ==============================================================
+        case STATE_GRIPPER_CONTROL:
+        {
+            if (!gripper_service_called_)
+            {
+                callGripperService();
+                gripper_service_called_ = true;
+            }
+            break;
+        }
+
+        // ==============================================================
+        // === DEFAULT ==================================================
+        // ==============================================================
+        default:
+            RCLCPP_ERROR(this->get_logger(),
+                         "❌ Unknown state: %d",
+                         static_cast<int>(getState()));
+            motion_planning_stage_ = 0;
+            setState(STATE_CHECK_HOME);
+            break;
+        }
+    }
+
+    void publishResult(bool success)
+    {
+        if (success)
+        {
+            RCLCPP_INFO(this->get_logger(), "✅ Plan succeeded.");
+        }
+        else
+        {
+            RCLCPP_WARN(this->get_logger(), "❌ Plan failed.");
+        }
+    }
+};
+
+int main(int argc, char **argv)
+{
+    rclcpp::init(argc, argv);
+    rclcpp::NodeOptions options;
+    options.automatically_declare_parameters_from_overrides(true);
+    options.parameter_overrides({{"use_sim_time", rclcpp::ParameterValue(true)}});
+    auto node = std::make_shared<MotionPlanning2PhasesNode>(options);
+    node->init();
+    rclcpp::spin(node);
+    rclcpp::shutdown();
+    return 0;
+}

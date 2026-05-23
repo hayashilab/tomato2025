@@ -1,0 +1,34 @@
+{
+  "configurations": [
+    {
+      "browse": {
+        "databaseFilename": "${default}",
+        "limitSymbolsToIncludedHeaders": false
+      },
+      "includePath": [
+        "/home/hayashi/tomato2025_ws/xarm_ws/install/xarm_moveit_control/include/**",
+        "/home/hayashi/tomato2025_ws/xarm_ws/install/xarm_planner/include/**",
+        "/home/hayashi/tomato2025_ws/xarm_ws/install/xarm_gazebo/include/**",
+        "/home/hayashi/tomato2025_ws/xarm_ws/install/xarm_controller/include/**",
+        "/home/hayashi/tomato2025_ws/xarm_ws/install/xarm_api/include/**",
+        "/home/hayashi/tomato2025_ws/xarm_ws/install/xarm_msgs/include/**",
+        "/home/hayashi/tomato2025_ws/xarm_ws/install/realsense_gazebo_plugin/include/**",
+        "/opt/ros/humble/include/**",
+        "/home/hayashi/tomato2025_ws/xarm_ws/src/xarm_moveit_control/include/**",
+        "/home/hayashi/tomato2025_ws/xarm_ws/src/xarm_ros2/thirdparty/realsense_gazebo_plugin/include/**",
+        "/home/hayashi/tomato2025_ws/xarm_ws/src/xarm_ros2/xarm_api/include/**",
+        "/home/hayashi/tomato2025_ws/xarm_ws/src/xarm_ros2/xarm_controller/include/**",
+        "/home/hayashi/tomato2025_ws/xarm_ws/src/xarm_ros2/xarm_gazebo/include/**",
+        "/home/hayashi/tomato2025_ws/xarm_ws/src/xarm_ros2/xarm_moveit_servo/include/**",
+        "/home/hayashi/tomato2025_ws/xarm_ws/src/xarm_ros2/xarm_planner/include/**",
+        "/usr/include/**"
+      ],
+      "name": "ROS",
+      "intelliSenseMode": "gcc-x64",
+      "compilerPath": "/usr/bin/gcc",
+      "cStandard": "gnu11",
+      "cppStandard": "c++14"
+    }
+  ],
+  "version": 4
+}

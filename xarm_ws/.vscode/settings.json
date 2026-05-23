@@ -1,0 +1,26 @@
+{
+    "python.autoComplete.extraPaths": [
+        "/home/hayashi/tomato2025_ws/xarm_ws/install/xarm_msgs/local/lib/python3.10/dist-packages",
+        "/home/hayashi/tomato2025_ws/xarm_ws/build/uf_ros_lib",
+        "/home/hayashi/tomato2025_ws/xarm_ws/install/uf_ros_lib/lib/python3.10/site-packages",
+        "/home/hayashi/tomato2025_ws/detection_ws/build/detection2025/.",
+        "/home/hayashi/tomato2025_ws/detection_ws/install/detection2025/lib/python3.10/site-packages",
+        "/opt/ros/humble/lib/python3.10/site-packages",
+        "/opt/ros/humble/local/lib/python3.10/dist-packages"
+    ],
+    "python.analysis.extraPaths": [
+        "/home/hayashi/tomato2025_ws/xarm_ws/install/xarm_msgs/local/lib/python3.10/dist-packages",
+        "/home/hayashi/tomato2025_ws/xarm_ws/build/uf_ros_lib",
+        "/home/hayashi/tomato2025_ws/xarm_ws/install/uf_ros_lib/lib/python3.10/site-packages",
+        "/home/hayashi/tomato2025_ws/detection_ws/build/detection2025/.",
+        "/home/hayashi/tomato2025_ws/detection_ws/install/detection2025/lib/python3.10/site-packages",
+        "/opt/ros/humble/lib/python3.10/site-packages",
+        "/opt/ros/humble/local/lib/python3.10/dist-packages"
+    ],
+    "files.associations": {
+        "chrono": "cpp",
+        "mutex": "cpp",
+        "future": "cpp",
+        "untitled document 1": "cpp"
+    }
+}

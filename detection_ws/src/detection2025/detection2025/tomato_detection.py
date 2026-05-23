@@ -1,0 +1,547 @@
+#!/usr/bin/env python3
+"""
+dual_tomato_detection.py
+------------------------------------------------------------
+Combined detection node for:
+  🟦 Azure Kinect  → fixed camera
+  🟩 Intel RealSense → end-effector camera on xArm7
+------------------------------------------------------------
+Both publish poses in `link_base` frame for MoveIt planning.
+Also publishes raw poses directly from each camera frame.
+Only "good tomato" detections are processed.
+"""
+
+import os
+import cv2
+import rclpy
+import numpy as np
+import message_filters
+from rclpy.node import Node
+from sensor_msgs.msg import Image, CameraInfo
+from geometry_msgs.msg import PoseStamped
+from cv_bridge import CvBridge
+from ultralytics import YOLO
+import random
+from std_srvs.srv import Trigger
+
+
+# TF
+import tf2_ros
+from tf2_ros import TransformException
+from tf_transformations import (
+    translation_matrix, quaternion_matrix, concatenate_matrices,
+    translation_from_matrix, quaternion_from_matrix
+)
+
+# helper modules
+from detection2025.math_module import extract_detections, organize_detections, process_all_detections
+from detection2025.overlay import overlay_frame, resize_frame
+
+
+class DualTomatoDetectionNode(Node):
+    def __init__(self):
+        super().__init__('dual_tomato_detection_node')
+        self.bridge = CvBridge()
+
+        # -----------------------------------------------------------
+        # Load YOLO model (shared for both cameras)
+        # -----------------------------------------------------------
+        import torch
+        model_path = os.path.expanduser('~/tomato2025_ws/detection_ws/src/detection2025/models/best.pt')
+        self.get_logger().info(f"Loading YOLO model from {model_path}")
+
+        self.model = YOLO(model_path)
+
+        # ✅ Move model to GPU (FP16) if available
+        if torch.cuda.is_available():
+            self.model.to('cuda')
+            self.model.overrides['imgsz'] = 640
+            self.get_logger().info("🚀 YOLO model moved to GPU")
+        else:
+            self.get_logger().warn("⚠️ CUDA not available — using CPU")
+
+        self.get_logger().info("YOLO model loaded ✅")
+
+        # -----------------------------------------------------------
+        # TF Buffer/Listener for transforms to link_base
+        # -----------------------------------------------------------
+        self.tf_buffer = tf2_ros.Buffer(rclpy.duration.Duration(seconds=10.0))
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+
+        # ===========================================================
+        # KINECT setup
+        # ===========================================================
+        self.kinect_color_sub = message_filters.Subscriber(self, Image, '/rgb/image_raw')
+        self.kinect_depth_sub = message_filters.Subscriber(self, Image, '/depth_to_rgb/image_raw')
+        self.kinect_info_sub = self.create_subscription(CameraInfo, '/rgb/camera_info', self.kinect_info_callback, 10)
+        self.kinect_camera_matrix = None
+
+        # Publishers
+        self.kinect_processed_pub = self.create_publisher(Image, '/kinect/tomato/processed_image', 10)
+        self.kinect_pose_pub = self.create_publisher(PoseStamped, '/kinect/tomato/target_pose', 10)
+        self.kinect_pose_cam_pub = self.create_publisher(PoseStamped, '/kinect/tomato/from_cam', 10)  # 🆕 added
+
+        # Sync - So RGB and Depth are synchronized before entering kinect_callback
+        self.kinect_sync = message_filters.ApproximateTimeSynchronizer(
+            [self.kinect_color_sub, self.kinect_depth_sub], 10, 0.1)
+        self.kinect_sync.registerCallback(self.kinect_callback)
+
+
+        # ===========================================================
+        # REALSENSE setup
+        # ===========================================================
+        self.rs_color_sub = message_filters.Subscriber(self, Image, '/camera/camera/color/image_rect_raw')
+        self.rs_depth_sub = message_filters.Subscriber(self, Image, '/camera/camera/aligned_depth_to_color/image_raw')
+        self.rs_info_sub = self.create_subscription(
+            CameraInfo,
+            '/camera/camera/color/camera_info',
+            self.rs_info_callback, 10)
+        self.rs_camera_matrix = None
+
+        # Publishers
+        self.rs_processed_pub = self.create_publisher(Image, '/realsense/tomato/processed_image', 10)
+        self.rs_pose_pub = self.create_publisher(PoseStamped, '/realsense/tomato/target_pose', 10)
+        self.rs_pose_cam_pub = self.create_publisher(PoseStamped, '/realsense/tomato/from_cam', 10)  # 🆕 added
+
+        # Sync
+        self.rs_sync = message_filters.ApproximateTimeSynchronizer(
+            [self.rs_color_sub, self.rs_depth_sub], 10, 0.1)
+        self.rs_sync.registerCallback(self.rs_callback)
+
+
+        self.get_logger().info("Dual tomato detection node initialized and waiting for images...")
+
+    # ==================================================================
+    # --- for post grasp grasp success checking ---
+    # ==================================================================
+        self.last_rs_color = None
+        self.last_rs_depth = None
+
+        self.rs_check_service = self.create_service(
+            Trigger, '/realsense/check_tomato_visible', self.handle_check_tomato_visible
+        )
+        self.last_rs_has_tomato = False
+
+    # ==================================================================
+    # --- Shared utilities ---
+    # ==================================================================
+    def convert_to_xyz(self, x, y, depth_meters, K):
+        fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
+        x_cam = (x - cx) * depth_meters / fx
+        y_cam = (y - cy) * depth_meters / fy
+        z_cam = depth_meters
+        return x_cam, y_cam, z_cam
+
+    # ===========================================================
+    # Tomato selection helper (supports top-N nearest)
+    # ===========================================================
+    def select_nearest_tomatoes(self, data, depth_resized, valid_labels, top_n=5, random_pick=True, source_name="Camera"):
+        """
+        Selects up to top-N nearest tomatoes (from valid_labels) based on depth.
+        Optionally returns a random tomato among those nearest ones.
+
+        Returns:
+            (selected_item, selected_depth_m, sorted_candidates)
+            where sorted_candidates = list of (item, depth) tuples sorted by depth.
+        """
+        candidates = []
+        h, w = depth_resized.shape
+
+        # --- Gather all valid detections with valid depth ---
+        for label in valid_labels:
+            if not data.get(label):
+                continue
+            for item in data[label]:
+                if item.get("centroid") is None:
+                    continue
+                x, y = map(int, item["centroid"])
+                x, y = int(np.clip(x, 0, w - 1)), int(np.clip(y, 0, h - 1))
+                roi = depth_resized[max(0, y - 5):min(h, y + 6),
+                                    max(0, x - 5):min(w, x + 6)]
+                vals = roi[roi > 0]
+                if len(vals) == 0:
+                    continue
+                d_m = np.median(vals) / 1000.0
+                if 0.0 < d_m < 20:  # Valid range
+                    candidates.append((item, d_m))
+
+        if not candidates:
+            self.get_logger().info(f"[{source_name}] No valid depth found for any tomato.")
+            return None, None, []
+
+        # --- Sort by depth (nearest first) ---
+        candidates.sort(key=lambda x: x[1])
+        top_candidates = candidates[:top_n]
+
+        # --- Pick one randomly or the very nearest ---
+        if random_pick:
+            selected_item, selected_depth = random.choice(top_candidates)
+            self.get_logger().info(
+                f"[{source_name}] Randomly picked 1 of top {len(top_candidates)} nearest "
+                f"({selected_item['detection']['element']} at {selected_depth:.3f} m)"
+            )
+        else:
+            selected_item, selected_depth = top_candidates[0]
+            self.get_logger().info(
+                f"[{source_name}] Picked nearest ({selected_item['detection']['element']} at {selected_depth:.3f} m)"
+            )
+
+        return selected_item, selected_depth, top_candidates
+
+
+
+    # Transform to link_base
+    def transform_pose(self, pose_in, source_frame, target_frame):
+        try:
+            tf = self.tf_buffer.lookup_transform(
+                target_frame, source_frame, rclpy.time.Time(),
+                rclpy.duration.Duration(seconds=1.0)
+            )
+            pos = [pose_in.pose.position.x, pose_in.pose.position.y, pose_in.pose.position.z]
+            rot = [pose_in.pose.orientation.x, pose_in.pose.orientation.y,
+                   pose_in.pose.orientation.z, pose_in.pose.orientation.w]
+            pose_mat = concatenate_matrices(translation_matrix(pos), quaternion_matrix(rot))
+            t_trans = [tf.transform.translation.x, tf.transform.translation.y, tf.transform.translation.z]
+            t_quat = [tf.transform.rotation.x, tf.transform.rotation.y,
+                      tf.transform.rotation.z, tf.transform.rotation.w]
+            tf_mat = concatenate_matrices(translation_matrix(t_trans), quaternion_matrix(t_quat))
+            result = concatenate_matrices(tf_mat, pose_mat)
+            tr = translation_from_matrix(result)
+            q = quaternion_from_matrix(result)
+
+            out = PoseStamped()
+            out.header.frame_id = target_frame
+            out.header.stamp = self.get_clock().now().to_msg()
+            out.pose.position.x, out.pose.position.y, out.pose.position.z = tr
+            out.pose.orientation.x, out.pose.orientation.y, out.pose.orientation.z, out.pose.orientation.w = q
+            return out, True
+        except TransformException as ex:
+            self.get_logger().warn(f"TF transform failed ({source_frame}→{target_frame}): {ex}")
+            return None, False
+
+    # ==================================================================
+    # Kinect masking helper
+    # ==================================================================
+    def apply_kinect_mask(self, img):
+        """Crop or mask the RGB image to keep only the green area (center region)."""
+        h, w, _ = img.shape
+        # ---- adjust ratios to match your plant frame area ----
+        x_min, x_max = int(w * 0.20), int(w * 0.40)  # left (bigger value cover more) and right (smaller value cover more)
+        y_min, y_max = int(h * 0.70), int(h * 0.90)  # Up (bigger value cover more) and down (smaller value cover more)
+
+        # Option 1️⃣: keep same image size but mask black outside region
+        mask = np.zeros_like(img)
+        mask[y_min:y_max, x_min:x_max] = img[y_min:y_max, x_min:x_max]
+        return mask
+
+        # Option 2️⃣ (alternative): crop smaller image (uncomment instead)
+        # return img[y_min:y_max, x_min:x_max]
+
+    # ==================================================================
+    # Kinect callbacks
+    # ==================================================================
+    def kinect_info_callback(self, msg):
+        """Store camera intrinsic matrix, scaled to match resized RGB (640×480)."""
+        K = np.array(msg.k).reshape(3, 3)
+        w0, h0 = msg.width, msg.height          # original image size from camera_info
+        w_new, h_new = 640, 480                 # your resize target
+        sx, sy = w_new / w0, h_new / h0
+        K[0, 0] *= sx  # fx
+        K[0, 2] *= sx  # cx
+        K[1, 1] *= sy  # fy
+        K[1, 2] *= sy  # cy
+        self.kinect_camera_matrix = K
+        self.get_logger().info(
+            f"Scaled Kinect intrinsics: fx={K[0,0]:.1f}, fy={K[1,1]:.1f}, cx={K[0,2]:.1f}, cy={K[1,2]:.1f}"
+        )
+
+
+    def kinect_callback(self, color_msg, depth_msg):
+        """Process synchronized Kinect RGB and depth frames"""
+        if self.kinect_camera_matrix is None:
+            self.get_logger().warn("No Kinect camera intrinsics yet.")
+            return
+
+        # --- Convert ROS -> OpenCV ---
+        color_cpu = self.bridge.imgmsg_to_cv2(color_msg, 'bgr8')
+        depth = self.bridge.imgmsg_to_cv2(depth_msg, 'passthrough')
+
+        # Resize BOTH RGB and depth so pixel coordinates match
+        color = cv2.resize(color_cpu, (640, 480))
+        depth_resized = cv2.resize(depth, (640, 480), interpolation=cv2.INTER_NEAREST)
+
+        # --- Apply mask to keep only center green region ---
+        color = self.apply_kinect_mask(color)
+
+
+        # --- YOLO detection ---
+        results = self.model.predict(color)
+        dets = extract_detections(results)
+        data = process_all_detections(
+            organize_detections(dets), color, confidence_threshold=0.55
+        )
+
+        print("hello")
+        ##########BACKUP###########################################
+        
+        # for r in results:
+        #     boxes = r.boxes.xyxy
+        #     for box in boxes:
+        #         x1, y1, x2, y2 = box.tolist()
+        #         rut_cx = (x1+x2) / 2
+        #         rut_cy = (y1+y2) / 2
+        
+
+        # --- Visualization overlay ---
+        overlay_img = overlay_frame(color, data, {
+            "elements": {"good tomato": [0], "bad tomato": [0],
+                         "green tomato": [0], "stem": [0]},
+            "math_processes": {"detection": True, "name": True, "contour": True,
+                               "centroid": True, "ellipse": True},
+            "overlay": True, "resize": True
+        })
+        self.kinect_processed_pub.publish(self.bridge.cv2_to_imgmsg(overlay_img, 'bgr8'))
+
+        # # --- Only good tomatoes ---
+        # if not data.get("good tomato"):
+        #     return
+        # item = data["good tomato"][0]
+        
+        # # -- if want both good and bad (occluded) tomatoes
+        # for label in ["good tomato", "bad tomato"]:
+        #     if data.get(label):
+        #         item = data[label][0]
+
+        # --- Select nearest N tomato among good (and optionally bad) ---
+        valid_labels = ["good tomato"]  # or add "bad tomato"
+        item, d_m, top_candidates = self.select_nearest_tomatoes(
+            data, depth_resized, valid_labels,
+            top_n=5, random_pick=True, source_name="Kinect"
+        )
+        if item is None:
+            return
+
+
+        if item.get("centroid") is None:
+            return
+        # --- Depth lookup ---
+        x, y = map(int, item["centroid"])
+        # x, y = rut_cx, rut_cy     #back up only normally turn off
+        print(x)
+        print("hell")
+        h, w = depth_resized.shape
+        x, y = int(np.clip(x, 0, w - 1)), int(np.clip(y, 0, h - 1))
+
+        roi = depth_resized[max(0, y - 5):min(h, y + 6),
+                            max(0, x - 5):min(w, x + 6)]
+
+        vals = roi[roi > 0]
+        if len(vals) == 0:
+            return
+        d_m = np.median(vals) / 1000.0
+        # Add a depth filter (in meters)
+        if d_m < 0 or d_m > 20:
+            self.get_logger().info(f"Tomato at {d_m:.2f} m ignored by depth filter.")
+            return
+
+
+        # --- Convert pixel → 3D (Kinect optical frame) ---
+        X, Y, Z = self.convert_to_xyz(x, y, d_m, self.kinect_camera_matrix)
+
+        # --- Correct optical → camera link mapping ---
+        # Convert Kinect optical frame → base-aligned camera frame
+        pose_cam = PoseStamped()
+        pose_cam.header.frame_id = "rgb_camera_link"
+        pose_cam.header.stamp = self.get_clock().now().to_msg()
+        pose_cam.pose.position.x = X
+        pose_cam.pose.position.y = Y
+        pose_cam.pose.position.z = Z    # up
+        pose_cam.pose.orientation.x = 0.0
+        pose_cam.pose.orientation.y = 0.0
+        pose_cam.pose.orientation.z = 0.0
+        pose_cam.pose.orientation.w = 1.0
+
+        # --- Publish directly from camera frame ---
+        self.kinect_pose_cam_pub.publish(pose_cam)
+
+        # --- Transform to link_base for MoveIt ---
+        pose_base, ok = self.transform_pose(pose_cam, "rgb_camera_link", "link_base")
+        if ok:
+            self.kinect_pose_pub.publish(pose_base)
+            self.get_logger().info(
+                f"[Kinect] good tomato depth={d_m:.3f} m "
+                f"→ link_base (x={pose_base.pose.position.x:.3f}, "
+                f"y={pose_base.pose.position.y:.3f}, "
+                f"z={pose_base.pose.position.z:.3f})"
+            )
+
+    # ==================================================================
+    # 🟩 RealSense callbacks
+    # ==================================================================
+    def rs_info_callback(self, msg):
+        K = np.array(msg.k).reshape(3, 3)
+
+        # --- Match RealSense RGB resize target (640×480) ---
+        w0, h0 = msg.width, msg.height
+        w_new, h_new = 640, 480
+        sx, sy = w_new / w0, h_new / h0
+        K[0, 0] *= sx  # fx
+        K[0, 2] *= sx  # cx
+        K[1, 1] *= sy  # fy
+        K[1, 2] *= sy  # cy
+
+        self.rs_camera_matrix = K
+        self.get_logger().info(
+            f"Scaled RealSense intrinsics: fx={K[0,0]:.1f}, fy={K[1,1]:.1f}, "
+            f"cx={K[0,2]:.1f}, cy={K[1,2]:.1f}"
+        )
+
+
+    def rs_callback(self, color_msg, depth_msg):
+        if self.rs_camera_matrix is None:
+            return
+        
+        # Save last frames for service query
+        self.last_rs_color = color_msg
+        self.last_rs_depth = depth_msg
+
+
+        color_cpu = self.bridge.imgmsg_to_cv2(color_msg, 'bgr8')
+        depth = self.bridge.imgmsg_to_cv2(depth_msg, 'passthrough')
+        color = cv2.resize(color_cpu, (640, 480))
+        depth_resized = cv2.resize(depth, (640, 480), interpolation=cv2.INTER_NEAREST)
+        
+        results = self.model.predict(color)
+        dets = extract_detections(results)
+        data = process_all_detections(organize_detections(dets), color, confidence_threshold=0.6)
+
+        ##########BACKUP###########################################
+      
+        # for r in results:
+        #     boxes = r.boxes.xyxy
+        #     for box in boxes:
+        #         x1, y1, x2, y2 = box.tolist()
+        #         rut_cx = (x1+x2) / 2
+        #         rut_cy = (y1+y2) / 2
+     
+        
+
+        overlay_img = overlay_frame(color, data, {
+            "elements": {"good tomato": [0], "bad tomato": [0], "green tomato": [0], "stem": [0]},
+            "math_processes": {"detection": True, "name": True, "contour": True, "centroid": True, "ellipse": True},
+            "overlay": True, "resize": True
+        })
+        self.rs_processed_pub.publish(self.bridge.cv2_to_imgmsg(overlay_img, 'bgr8'))
+
+
+        # # --- Only good tomatoes ---
+        if not data.get("good tomato"):
+            return
+        item = data["good tomato"][0]
+
+        # # -- if want both good and bad (occluded) tomatoes
+        # for label in ["good tomato", "bad tomato"]:
+        #     if data.get(label):
+        #         item = data[label][0]
+
+        if item.get("centroid") is None:
+            return
+
+        # --- Depth lookup ---
+        x, y = map(int, item["centroid"])
+        # x, y = rut_cx, rut_cy   #back up only normally turn off
+        print(x, y)
+        h, w = depth_resized.shape
+        x, y = int(np.clip(x, 0, w - 1)), int(np.clip(y, 0, h - 1))
+
+        roi = depth_resized[max(0, y-5):min(h, y+6), max(0, x-5):min(w, x+6)]
+        vals = roi[roi > 0]
+        if len(vals) == 0:
+            return
+        d_m = np.median(vals) / 1000.0
+        # Add a depth filter (in meters)
+        if d_m < 0.00 or d_m > 20:
+            self.get_logger().info(f"Tomato at {d_m:.2f} m ignored by depth filter.")
+            return
+
+
+        # --- Convert pixel → 3D (Kinect optical frame) ---
+        X, Y, Z = self.convert_to_xyz(x, y, d_m, self.rs_camera_matrix)
+
+        # --- Correct optical → base-aligned camera frame ---
+        # RealSense optical frame: +X=right, +Y=down, +Z=forward
+        pose_cam = PoseStamped()
+        pose_cam.header.frame_id = "camera_color_optical_frame"
+        pose_cam.header.stamp = self.get_clock().now().to_msg()
+        pose_cam.pose.position.x = X      # right
+        pose_cam.pose.position.y = Y      # down
+        pose_cam.pose.position.z = Z      # forward
+        pose_cam.pose.orientation.w = 1.0
+
+
+        # --- Publish directly from camera frame ---
+        self.rs_pose_cam_pub.publish(pose_cam)
+
+        # --- Transform to link_base for MoveIt ---
+        pose_base, ok = self.transform_pose(pose_cam, "camera_color_optical_frame", "link_base")
+        if ok:
+            self.rs_pose_pub.publish(pose_base)
+            self.get_logger().info(
+                f"[RealSense] good tomato depth={d_m:.3f} m "
+                f"→ link_base (x={pose_base.pose.position.x:.3f}, "
+                f"y={pose_base.pose.position.y:.3f}, "
+                f"z={pose_base.pose.position.z:.3f})"
+            )
+
+        # Update latest tomato visibility flag
+        self.last_rs_has_tomato = bool(data.get("good tomato"))
+
+
+    def handle_check_tomato_visible(self, request, response):
+        """Force real-time tomato detection when service is called."""
+        if self.rs_camera_matrix is None or self.last_rs_color is None or self.last_rs_depth is None:
+            response.success = False
+            response.message = "No valid RealSense frames yet."
+            return response
+
+        # Convert stored ROS messages to CV2
+        color_cpu = self.bridge.imgmsg_to_cv2(self.last_rs_color, 'bgr8')
+        depth = self.bridge.imgmsg_to_cv2(self.last_rs_depth, 'passthrough')
+
+        color = cv2.resize(color_cpu, (640, 480))
+        depth_resized = cv2.resize(depth, (640, 480), interpolation=cv2.INTER_NEAREST)
+
+        # Re-run YOLO instantly for this check
+        results = self.model.predict(color, verbose=False)
+        dets = extract_detections(results)
+        data = process_all_detections(organize_detections(dets), color, confidence_threshold=0.5)
+
+        has_good = bool(data.get("good tomato"))
+        if has_good:
+            response.success = True
+            response.message = "Good tomato detected (live check)."
+        else:
+            response.success = False
+            response.message = "No tomato detected (live check)."
+
+        # Update state variable for logging consistency
+        self.last_rs_has_tomato = has_good
+        self.get_logger().info(f"🍅 Grasp check (instant YOLO): {response.message}")
+        return response
+
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = DualTomatoDetectionNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
